@@ -7,6 +7,9 @@ import React, { useState, useEffect, useRef } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import {
   Mic,
+  MicOff,
+  Volume2,
+  VolumeX,
   Play,
   Pause,
   SkipForward,
@@ -25,7 +28,9 @@ import {
   Music,
   Share2,
   AlertCircle,
-  History
+  History,
+  MessageSquare,
+  Send
 } from "lucide-react";
 import { SingRoomParty, YTPlaylistItem } from "../types";
 
@@ -182,14 +187,291 @@ export default function SingRoomKtv() {
   });
 
   // UI States
+  const [isQrJoin, setIsQrJoin] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get("room") || params.get("join");
+    return !!(roomParam && roomParam.length === 5);
+  });
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSuggestions([]);
+      return;
+    }
+
+    const delayDebounceFn = setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/youtube/suggest?q=${encodeURIComponent(searchQuery.trim())}`);
+        if (response.ok) {
+          const data = await response.json();
+          setSuggestions(data);
+        }
+      } catch (err) {
+        console.error("Error fetching suggestions:", err);
+      }
+    }, 250);
+
+    return () => clearTimeout(delayDebounceFn);
+  }, [searchQuery]);
   const [isSearching, setIsSearching] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
   const [copiedCode, setCopiedCode] = useState(false);
-  const [activeMobileTab, setActiveMobileTab] = useState<"search" | "queue" | "sounds" | "history">("search");
+  const [activeMobileTab, setActiveMobileTab] = useState<"search" | "queue" | "sounds" | "history" | "chat">("search");
   const [floatingEmojis, setFloatingEmojis] = useState<FloatingEmoji[]>([]);
+
+  // Chat States
+  const [chatMessages, setChatMessages] = useState<any[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [hasNewChat, setHasNewChat] = useState(false);
+
+  const activeMobileTabRef = useRef(activeMobileTab);
+  useEffect(() => {
+    activeMobileTabRef.current = activeMobileTab;
+    if (activeMobileTab === "chat") {
+      setHasNewChat(false);
+    }
+  }, [activeMobileTab]);
+
+  const sendChatMessage = (textStr?: string) => {
+    const messageText = textStr !== undefined ? textStr : chatInput;
+    if (!messageText.trim() || !socketRef.current || !room) return;
+
+    socketRef.current.send(
+      JSON.stringify({
+        type: "send-message",
+        roomId: room.id,
+        sender: nickname || "Singer",
+        text: messageText.trim()
+      })
+    );
+    if (textStr === undefined) {
+      setChatInput("");
+    }
+  };
+
+  const sendChatReaction = (emoji: string) => {
+    if (!socketRef.current || !room) return;
+    socketRef.current.send(
+      JSON.stringify({
+        type: "send-message",
+        roomId: room.id,
+        sender: nickname || "Singer",
+        text: emoji
+      })
+    );
+  };
+
+  // Voice Control States
+  const [isListening, setIsListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("Tap microphone to start voice commands");
+  const [isTtsEnabled, setIsTtsEnabled] = useState(true);
+  const [voiceLog, setVoiceLog] = useState<{ text: string; isCommand: boolean }[]>([]);
+  const recognitionRef = useRef<any>(null);
+
+  const roomRef = useRef(room);
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
+
+  const nicknameRef = useRef(nickname);
+  useEffect(() => {
+    nicknameRef.current = nickname;
+  }, [nickname]);
+
+  const processVoiceCommand = async (rawText: string) => {
+    const text = rawText.toLowerCase().trim();
+
+    const speakBack = (msg: string) => {
+      if (isTtsEnabled && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(msg);
+        utterance.rate = 1.05;
+        window.speechSynthesis.speak(utterance);
+      }
+    };
+
+    // Helper to log actions
+    const logAction = (cmdText: string) => {
+      setVoiceLog((prev) => [{ text: cmdText, isCommand: true }, ...prev.slice(0, 9)]);
+    };
+
+    // 1. Play / Resume
+    if (text === "play" || text === "resume" || text === "start" || text === "unpause" || text === "continue") {
+      setVoiceStatus("Command: Play");
+      logAction("▶️ Play / Resume");
+      speakBack("Playing song");
+      playbackControl("play");
+      return;
+    }
+
+    // 2. Pause / Stop
+    if (text === "pause" || text === "stop" || text === "hold" || text === "freeze") {
+      setVoiceStatus("Command: Pause");
+      logAction("⏸️ Pause");
+      speakBack("Pausing song");
+      playbackControl("pause");
+      return;
+    }
+
+    // 3. Skip / Next
+    if (text === "skip" || text === "next" || text === "skip song" || text === "next song") {
+      setVoiceStatus("Command: Skip");
+      logAction("⏭️ Skip Song");
+      speakBack("Skipping song");
+      playbackControl("next");
+      return;
+    }
+
+    // 4. Previous / Back
+    if (text === "previous" || text === "prev" || text === "back" || text === "go back") {
+      setVoiceStatus("Command: Previous");
+      logAction("⏮️ Previous Song");
+      speakBack("Going back to previous song");
+      playbackControl("prev");
+      return;
+    }
+
+    // 5. Add to queue / Search & Queue
+    const queuePatterns = [
+      /^(?:add to queue|add)\s+(.+?)(?:\s+to\s+queue)?$/,
+      /^(?:queue|sing|play)\s+(.+)$/
+    ];
+
+    let query = "";
+    for (const pattern of queuePatterns) {
+      const match = text.match(pattern);
+      if (match && match[1]) {
+        const potentialQuery = match[1].trim();
+        if (potentialQuery && potentialQuery !== "song" && potentialQuery !== "it" && potentialQuery !== "music") {
+          query = potentialQuery;
+          break;
+        }
+      }
+    }
+
+    if (query) {
+      setVoiceStatus(`Searching for: "${query}"`);
+      logAction(`🔍 Queue: "${query}"`);
+      speakBack(`Searching for ${query}`);
+
+      try {
+        const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(query + " karaoke")}`);
+        if (!response.ok) throw new Error("Search request failed");
+        const results = await response.json();
+        
+        if (results && results.length > 0) {
+          const bestMatch = results[0];
+          setVoiceStatus(`Added: "${bestMatch.title}"`);
+          logAction(`➕ Added "${bestMatch.title}"`);
+          speakBack(`Queueing ${bestMatch.title}`);
+          
+          if (socketRef.current && roomRef.current) {
+            socketRef.current.send(
+              JSON.stringify({
+                type: "party-add-song",
+                roomId: roomRef.current.id,
+                song: {
+                  videoId: bestMatch.videoId,
+                  title: bestMatch.title,
+                  thumbnail: bestMatch.thumbnail,
+                  channelTitle: bestMatch.channelTitle
+                },
+                queuedBy: nicknameRef.current || "Voice Assistant"
+              })
+            );
+          }
+        } else {
+          setVoiceStatus(`No results found for "${query}"`);
+          speakBack(`No karaoke results found for ${query}`);
+        }
+      } catch (err) {
+        console.error("Voice search error:", err);
+        setVoiceStatus("Search failed.");
+        speakBack("Error searching for that song.");
+      }
+    } else {
+      setVoiceStatus(`Unknown command: "${rawText}"`);
+      speakBack(`Sorry, I didn't recognize that command.`);
+    }
+  };
+
+  const processVoiceCommandRef = useRef(processVoiceCommand);
+  useEffect(() => {
+    processVoiceCommandRef.current = processVoiceCommand;
+  });
+
+  // Toggle speech listening
+  const toggleListening = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+    } else {
+      setErrorMsg("");
+      setVoiceStatus("Activating mic...");
+      try {
+        recognitionRef.current?.start();
+      } catch (err: any) {
+        console.error(err);
+        setVoiceStatus(`Error: Could not start mic.`);
+      }
+    }
+  };
+
+  // Speech recognition initialization
+  useEffect(() => {
+    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognitionClass) {
+      setVoiceStatus("Voice Control not supported in this browser");
+      return;
+    }
+
+    const rec = new SpeechRecognitionClass();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = "en-US";
+
+    rec.onstart = () => {
+      setIsListening(true);
+      setVoiceStatus("Listening... Try 'skip song' or 'queue Hello'");
+    };
+
+    rec.onend = () => {
+      setIsListening(false);
+    };
+
+    rec.onerror = (event: any) => {
+      console.error("Speech Recognition Error", event);
+      if (event.error === "not-allowed") {
+        setVoiceStatus("Microphone access denied. Check browser permissions.");
+      } else {
+        setVoiceStatus(`Error: ${event.error}`);
+      }
+      setIsListening(false);
+    };
+
+    rec.onresult = async (event: any) => {
+      const transcript = event.results[event.resultIndex][0].transcript.trim();
+      setVoiceStatus(`Heard: "${transcript}"`);
+      setVoiceLog((prev) => [{ text: transcript, isCommand: false }, ...prev.slice(0, 9)]);
+      if (processVoiceCommandRef.current) {
+        await processVoiceCommandRef.current(transcript);
+      }
+    };
+
+    recognitionRef.current = rec;
+
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (e) {}
+      }
+    };
+  }, []);
 
   const triggerFloatingEmoji = (emoji: string, userName: string, soundName: string) => {
     const id = "emoji_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
@@ -282,6 +564,19 @@ export default function SingRoomKtv() {
             }
             // Trigger floating emoji animation on Host screen
             triggerFloatingEmoji(effect.emoji, userName, effect.name);
+          }
+        } else if (data.type === "chat-message" && data.message) {
+          setChatMessages((prev) => [...prev, data.message].slice(-150));
+          
+          if (activeMobileTabRef.current !== "chat") {
+            setHasNewChat(true);
+          }
+          
+          // Trigger floating emojis for emoji-only or emoji-rich short messages on Host screen
+          const text = data.message.text || "";
+          const isCurrentUserHost = roomRef.current?.hostId === userId || isHostRole;
+          if (isCurrentUserHost && text.trim().length <= 6 && /\p{Extended_Pictographic}/u.test(text)) {
+            triggerFloatingEmoji(text.trim(), data.message.sender, "Chat Reaction");
           }
         }
       } catch (err) {
@@ -492,6 +787,12 @@ export default function SingRoomKtv() {
       setIsHostRole(false);
       setRoom(data);
       setSuccessMsg(`Joined room "${data.name}" successfully!`);
+      setIsQrJoin(false);
+      try {
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } catch (e) {
+        console.error("Failed to clean up URL search parameters:", e);
+      }
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to join room. Verify code is active.");
     }
@@ -519,6 +820,27 @@ export default function SingRoomKtv() {
     setIsSearching(true);
     try {
       const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(searchQuery.trim())}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to complete YouTube search.");
+      }
+      setSearchResults(data);
+    } catch (err: any) {
+      setErrorMsg(err.message || "YouTube search failed.");
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const handleSelectSuggestion = async (suggestion: string) => {
+    setSearchQuery(suggestion);
+    setSuggestions([]);
+    setShowSuggestions(false);
+
+    setErrorMsg("");
+    setIsSearching(true);
+    try {
+      const response = await fetch(`/api/youtube/search?q=${encodeURIComponent(suggestion.trim())}`);
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || "Failed to complete YouTube search.");
@@ -681,131 +1003,205 @@ export default function SingRoomKtv() {
         
         {/* ==================== 1. LANDING PAGE (NOT IN ROOM) ==================== */}
         {!room ? (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center max-w-5xl mx-auto w-full py-6">
-            
-            {/* Landing Copy Column */}
-            <div className="lg:col-span-5 space-y-6 text-center lg:text-left">
-              <div className="inline-flex items-center gap-2 bg-gradient-to-r from-indigo-500/10 to-cyan-500/10 border border-indigo-500/20 px-3 py-1.5 rounded-full text-xs font-mono text-cyan-400">
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Next-Gen Karaoke Lounge</span>
-              </div>
-              <h2 className="text-4xl lg:text-5xl font-black tracking-tight leading-tight text-white font-display">
-                Bring the KTV Party to Your <span className="bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">Big Screen</span>
-              </h2>
-              <p className="text-sm text-slate-400 leading-relaxed max-w-md mx-auto lg:mx-0">
-                My Karaoke lets you host karaoke on your TV or laptop. Guests can join instantly with their phones, search YouTube, and queue tracks dynamically. Perfect sync, zero fuss!
-              </p>
+          isQrJoin ? (
+            <div className="max-w-md mx-auto w-full py-12 animate-fade-in">
+              <div className="bg-slate-900/60 border border-cyan-500/30 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 relative overflow-hidden backdrop-blur-xl">
+                {/* Glowing ambient background effect */}
+                <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none" />
+                <div className="absolute bottom-0 left-0 w-32 h-32 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none" />
 
-              {/* Step Hints */}
-              <div className="grid grid-cols-3 gap-4 pt-4 max-w-md mx-auto lg:mx-0 text-left">
-                <div className="space-y-1">
-                  <span className="block font-mono text-xs font-bold text-cyan-400">01. Host</span>
-                  <span className="block text-[11px] text-slate-500 leading-tight">Create a room on your big screen</span>
+                <div className="text-center space-y-2">
+                  <div className="inline-flex items-center gap-1.5 bg-cyan-500/10 border border-cyan-500/30 px-3 py-1.5 rounded-full text-[10px] font-mono font-bold text-cyan-400 uppercase tracking-widest">
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>Scanned QR Code</span>
+                  </div>
+                  <h2 className="text-2xl font-black text-white tracking-tight font-display">
+                    You're Invited to Sing!
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Connecting to Lounge Room Code: <span className="font-mono font-black text-cyan-400 bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800 ml-1 select-all">{roomIdInput}</span>
+                  </p>
                 </div>
-                <div className="space-y-1">
-                  <span className="block font-mono text-xs font-bold text-indigo-400">02. QR Scan</span>
-                  <span className="block text-[11px] text-slate-500 leading-tight">Guests scan with their phone</span>
-                </div>
-                <div className="space-y-1">
-                  <span className="block font-mono text-xs font-bold text-cyan-400">03. Sing</span>
-                  <span className="block text-[11px] text-slate-500 leading-tight">Queue tracks and sing together</span>
+
+                {/* Error message */}
+                {errorMsg && (
+                  <div className="p-3 bg-red-950/45 border border-red-900/50 rounded-xl flex items-start gap-2 text-xs text-red-300">
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                    <span>{errorMsg}</span>
+                  </div>
+                )}
+
+                <form onSubmit={joinRoom} className="space-y-5">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold font-mono text-slate-400 uppercase tracking-wider">
+                      🎤 Pick Your Stage Nickname
+                    </label>
+                    <div className="relative">
+                      <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 font-mono text-sm">@</span>
+                      <input
+                        type="text"
+                        maxLength={15}
+                        required
+                        placeholder="e.g. Vocalist99"
+                        value={nickname}
+                        onChange={(e) => setNickname(e.target.value.replace(/\s+/g, ""))}
+                        className="w-full pl-8 pr-4 py-3 bg-slate-950 border border-slate-800 rounded-xl text-sm font-semibold text-white focus:outline-none focus:border-cyan-500 transition-all shadow-inner placeholder-slate-700"
+                      />
+                    </div>
+                    <p className="text-[10px] text-slate-500">
+                      Your tracks and soundboard triggers will show up under this name!
+                    </p>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full py-3 bg-gradient-to-r from-cyan-500 to-indigo-500 hover:from-cyan-400 hover:to-indigo-400 text-black font-extrabold text-sm rounded-xl transition-all shadow-lg shadow-cyan-500/10 active:scale-95 cursor-pointer flex items-center justify-center gap-2"
+                  >
+                    <span>Connect & Start Singing</span>
+                    <Music className="w-4 h-4" />
+                  </button>
+                </form>
+
+                <div className="text-center pt-2 border-t border-slate-850">
+                  <button
+                    onClick={() => {
+                      setIsQrJoin(false);
+                      setErrorMsg("");
+                    }}
+                    className="text-xs text-slate-400 hover:text-white transition-colors underline decoration-slate-600 underline-offset-4 cursor-pointer"
+                  >
+                    Or create a new room instead
+                  </button>
                 </div>
               </div>
             </div>
-
-            {/* Forms Column (Create / Join cards) */}
-            <div className="lg:col-span-7 grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center max-w-5xl mx-auto w-full py-6">
               
-              {/* NICKNAME BOX (Shared prerequisite) */}
-              <div className="col-span-full bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
-                <label className="block text-xs font-bold font-mono tracking-wider text-slate-400 uppercase">
-                  🎤 Pick Your Stage Nickname First
-                </label>
-                <div className="relative">
-                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 font-mono text-xs">@</span>
-                  <input
-                    type="text"
-                    maxLength={15}
-                    placeholder="e.g. Vocalist99"
-                    value={nickname}
-                    onChange={(e) => setNickname(e.target.value.replace(/\s+/g, ""))}
-                    className="w-full pl-8 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm font-semibold text-white focus:outline-none focus:border-cyan-500 transition-all shadow-inner placeholder-slate-600"
-                  />
+              {/* Landing Copy Column */}
+              <div className="lg:col-span-5 space-y-6 text-center lg:text-left">
+                <div className="inline-flex items-center gap-2 bg-gradient-to-r from-indigo-500/10 to-cyan-500/10 border border-indigo-500/20 px-3 py-1.5 rounded-full text-xs font-mono text-cyan-400">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Next-Gen Karaoke Lounge</span>
                 </div>
-                <p className="text-[10px] text-slate-500">
-                  This identifier will highlight your queued tracks on the big screen!
+                <h2 className="text-4xl lg:text-5xl font-black tracking-tight leading-tight text-white font-display">
+                  Bring the KTV Party to Your <span className="bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">Big Screen</span>
+                </h2>
+                <p className="text-sm text-slate-400 leading-relaxed max-w-md mx-auto lg:mx-0">
+                  My Karaoke lets you host karaoke on your TV or laptop. Guests can join instantly with their phones, search YouTube, and queue tracks dynamically. Perfect sync, zero fuss!
                 </p>
+
+                {/* Step Hints */}
+                <div className="grid grid-cols-3 gap-4 pt-4 max-w-md mx-auto lg:mx-0 text-left">
+                  <div className="space-y-1">
+                    <span className="block font-mono text-xs font-bold text-cyan-400">01. Host</span>
+                    <span className="block text-[11px] text-slate-500 leading-tight">Create a room on your big screen</span>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="block font-mono text-xs font-bold text-indigo-400">02. QR Scan</span>
+                    <span className="block text-[11px] text-slate-500 leading-tight">Guests scan with their phone</span>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="block font-mono text-xs font-bold text-cyan-400">03. Sing</span>
+                    <span className="block text-[11px] text-slate-500 leading-tight">Queue tracks and sing together</span>
+                  </div>
+                </div>
               </div>
 
-              {/* CREATE ROOM CARD */}
-              <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between hover:border-indigo-500/40 transition-all">
-                <div className="space-y-3">
-                  <div className="w-9 h-9 rounded-lg bg-indigo-500/10 flex items-center justify-center text-indigo-400">
-                    <Plus className="w-5 h-5" />
+              {/* Forms Column (Create / Join cards) */}
+              <div className="lg:col-span-7 grid grid-cols-1 md:grid-cols-2 gap-6 w-full">
+                
+                {/* NICKNAME BOX (Shared prerequisite) */}
+                <div className="col-span-full bg-slate-900/60 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
+                  <label className="block text-xs font-bold font-mono tracking-wider text-slate-400 uppercase">
+                    🎤 Pick Your Stage Nickname First
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 font-mono text-xs">@</span>
+                    <input
+                      type="text"
+                      maxLength={15}
+                      placeholder="e.g. Vocalist99"
+                      value={nickname}
+                      onChange={(e) => setNickname(e.target.value.replace(/\s+/g, ""))}
+                      className="w-full pl-8 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm font-semibold text-white focus:outline-none focus:border-cyan-500 transition-all shadow-inner placeholder-slate-600"
+                    />
                   </div>
-                  <h3 className="text-lg font-bold text-white tracking-tight">Create a New Room</h3>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    Set up a central room. Designed to be opened on your TV or computer monitor.
+                  <p className="text-[10px] text-slate-500">
+                    This identifier will highlight your queued tracks on the big screen!
                   </p>
                 </div>
 
-                <form onSubmit={createRoom} className="space-y-4 mt-6">
-                  <div className="space-y-1">
-                    <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">Lounge/TV Room Name</label>
-                    <input
-                      type="text"
-                      required
-                      placeholder="e.g. Living Room Party"
-                      value={roomNameInput}
-                      onChange={(e) => setRoomNameInput(e.target.value)}
-                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-semibold text-white focus:outline-none focus:border-indigo-500"
-                    />
+                {/* CREATE ROOM CARD */}
+                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between hover:border-indigo-500/40 transition-all">
+                  <div className="space-y-3">
+                    <div className="w-9 h-9 rounded-lg bg-indigo-500/10 flex items-center justify-center text-indigo-400">
+                      <Plus className="w-5 h-5" />
+                    </div>
+                    <h3 className="text-lg font-bold text-white tracking-tight">Create a New Room</h3>
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      Set up a central room. Designed to be opened on your TV or computer monitor.
+                    </p>
                   </div>
-                  <button
-                    type="submit"
-                    className="w-full py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 font-bold text-xs text-white rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-                  >
-                    Launch Room as Host
-                  </button>
-                </form>
-              </div>
 
-              {/* JOIN ROOM CARD */}
-              <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between hover:border-cyan-500/40 transition-all">
-                <div className="space-y-3">
-                  <div className="w-9 h-9 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
-                    <Smartphone className="w-5 h-5" />
-                  </div>
-                  <h3 className="text-lg font-bold text-white tracking-tight">Join an Existing Room</h3>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    Sing along or queue songs! Enter a 5-digit code or scan a QR code from the TV.
-                  </p>
+                  <form onSubmit={createRoom} className="space-y-4 mt-6">
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">Lounge/TV Room Name</label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="e.g. Living Room Party"
+                        value={roomNameInput}
+                        onChange={(e) => setRoomNameInput(e.target.value)}
+                        className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-semibold text-white focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 font-bold text-xs text-white rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
+                    >
+                      Launch Room as Host
+                    </button>
+                  </form>
                 </div>
 
-                <form onSubmit={joinRoom} className="space-y-4 mt-6">
-                  <div className="space-y-1">
-                    <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">5-digit Room Code</label>
-                    <input
-                      type="text"
-                      required
-                      maxLength={5}
-                      placeholder="e.g. A9B8D"
-                      value={roomIdInput}
-                      onChange={(e) => setRoomIdInput(e.target.value.toUpperCase().trim())}
-                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono font-bold text-cyan-400 placeholder-slate-700 uppercase tracking-widest focus:outline-none focus:border-cyan-500"
-                    />
+                {/* JOIN ROOM CARD */}
+                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col justify-between hover:border-cyan-500/40 transition-all">
+                  <div className="space-y-3">
+                    <div className="w-9 h-9 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
+                      <Smartphone className="w-5 h-5" />
+                    </div>
+                    <h3 className="text-lg font-bold text-white tracking-tight">Join an Existing Room</h3>
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      Sing along or queue songs! Enter a 5-digit code or scan a QR code from the TV.
+                    </p>
                   </div>
-                  <button
-                    type="submit"
-                    className="w-full py-2.5 bg-gradient-to-r from-cyan-500 to-cyan-600 hover:from-cyan-400 hover:to-cyan-500 font-bold text-xs text-black rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
-                  >
-                    Connect as Guest
-                  </button>
-                </form>
-              </div>
 
+                  <form onSubmit={joinRoom} className="space-y-4 mt-6">
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">5-digit Room Code</label>
+                      <input
+                        type="text"
+                        required
+                        maxLength={5}
+                        placeholder="e.g. A9B8D"
+                        value={roomIdInput}
+                        onChange={(e) => setRoomIdInput(e.target.value.toUpperCase().trim())}
+                        className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono font-bold text-cyan-400 placeholder-slate-700 uppercase tracking-widest focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-2.5 bg-gradient-to-r from-cyan-500 to-cyan-600 hover:from-cyan-400 hover:to-cyan-500 font-bold text-xs text-black rounded-xl transition-all shadow-md active:scale-95 cursor-pointer"
+                    >
+                      Connect as Guest
+                    </button>
+                  </form>
+                </div>
+
+              </div>
             </div>
-          </div>
+          )
         ) : (
           
           // ==================== 2. ROOM WORKSPACE (ACTIVE IN ROOM) ====================
@@ -956,6 +1352,16 @@ export default function SingRoomKtv() {
                       ))}
                     </div>
                   </div>
+
+                  {/* STAGE VOICE CONTROL ASSISTANT */}
+                  <VoiceControlCard
+                    isListening={isListening}
+                    voiceStatus={voiceStatus}
+                    isTtsEnabled={isTtsEnabled}
+                    setIsTtsEnabled={setIsTtsEnabled}
+                    toggleListening={toggleListening}
+                    voiceLog={voiceLog}
+                  />
 
                   {/* HOST CONTROLS & INFO BOARD */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1139,6 +1545,10 @@ export default function SingRoomKtv() {
                         placeholder="Search songs directly..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
+                        onFocus={() => setShowSuggestions(true)}
+                        onBlur={() => {
+                          setTimeout(() => setShowSuggestions(false), 200);
+                        }}
                         className="w-full pl-3 pr-8 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs placeholder-slate-600 text-white focus:outline-none focus:border-cyan-500"
                       />
                       <button
@@ -1147,6 +1557,23 @@ export default function SingRoomKtv() {
                       >
                         <Search className="w-4 h-4" />
                       </button>
+
+                      {/* Auto-suggest suggestions list */}
+                      {showSuggestions && suggestions.length > 0 && (
+                        <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[200px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
+                          {suggestions.map((suggestion, idx) => (
+                            <button
+                              key={`host-suggest-${idx}`}
+                              type="button"
+                              onClick={() => handleSelectSuggestion(suggestion)}
+                              className="w-full px-3 py-2 text-left text-[11px] text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
+                            >
+                              <Search className="w-3 h-3 text-slate-600 shrink-0" />
+                              <span className="truncate">{suggestion}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </form>
 
                     {searchResults.length > 0 && (
@@ -1181,6 +1608,18 @@ export default function SingRoomKtv() {
                     )}
                   </div>
 
+                  {/* LIVE LOUNGE CHAT */}
+                  <div className="border-t border-slate-800/80 pt-4 mt-2">
+                    <LoungeChatBox
+                      chatMessages={chatMessages}
+                      chatInput={chatInput}
+                      setChatInput={setChatInput}
+                      sendChatMessage={sendChatMessage}
+                      sendChatReaction={sendChatReaction}
+                      nickname={nickname}
+                    />
+                  </div>
+
                 </div>
 
               </div>
@@ -1205,20 +1644,30 @@ export default function SingRoomKtv() {
                   </span>
                 </div>
 
-                {/* Tab layout: Search Songs vs Active Queue vs Soundboard vs History */}
-                <div className="grid grid-cols-4 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                {/* STAGE VOICE CONTROL ASSISTANT */}
+                <VoiceControlCard
+                  isListening={isListening}
+                  voiceStatus={voiceStatus}
+                  isTtsEnabled={isTtsEnabled}
+                  setIsTtsEnabled={setIsTtsEnabled}
+                  toggleListening={toggleListening}
+                  voiceLog={voiceLog}
+                />
+
+                {/* Tab layout: Search Songs vs Active Queue vs Soundboard vs History vs Chat */}
+                <div className="grid grid-cols-5 bg-slate-950 p-1 rounded-xl border border-slate-800">
                   <button
                     onClick={() => setActiveMobileTab("search")}
-                    className={`flex items-center justify-center gap-1 py-2 rounded-lg text-[10px] sm:text-[11px] font-bold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
                       activeMobileTab === "search" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
                     <Search className="w-3.5 h-3.5" />
-                    <span>Search</span>
+                    <span className="hidden sm:inline">Search</span>
                   </button>
                   <button
                     onClick={() => setActiveMobileTab("queue")}
-                    className={`flex items-center justify-center gap-1 py-2 rounded-lg text-[10px] sm:text-[11px] font-bold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
                       activeMobileTab === "queue" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
@@ -1227,21 +1676,38 @@ export default function SingRoomKtv() {
                   </button>
                   <button
                     onClick={() => setActiveMobileTab("sounds")}
-                    className={`flex items-center justify-center gap-1 py-2 rounded-lg text-[10px] sm:text-[11px] font-bold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
                       activeMobileTab === "sounds" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
                     <Sparkles className="w-3.5 h-3.5" />
-                    <span>Sounds</span>
+                    <span className="hidden sm:inline">Sounds</span>
                   </button>
                   <button
                     onClick={() => setActiveMobileTab("history")}
-                    className={`flex items-center justify-center gap-1 py-2 rounded-lg text-[10px] sm:text-[11px] font-bold transition-all cursor-pointer ${
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
                       activeMobileTab === "history" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
                     <History className="w-3.5 h-3.5" />
-                    <span>History</span>
+                    <span className="hidden sm:inline">History</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveMobileTab("chat")}
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer relative ${
+                      activeMobileTab === "chat" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    <div className="relative">
+                      <MessageSquare className="w-3.5 h-3.5" />
+                      {hasNewChat && (
+                        <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+                        </span>
+                      )}
+                    </div>
+                    <span>Chat</span>
                   </button>
                 </div>
 
@@ -1270,17 +1736,40 @@ export default function SingRoomKtv() {
                 {/* TAB B1: SEARCH VIEW */}
                 {activeMobileTab === "search" && (
                   <div className="space-y-4 animate-fade-in">
-                    <form onSubmit={searchSongs} className="flex gap-2">
-                      <input
-                        type="text"
-                        placeholder="Search YouTube track (e.g. Queen)"
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        className="flex-1 px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
-                      />
+                    <form onSubmit={searchSongs} className="flex gap-2 relative">
+                      <div className="relative flex-1">
+                        <input
+                          type="text"
+                          placeholder="Search YouTube track (e.g. Queen)"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          onFocus={() => setShowSuggestions(true)}
+                          onBlur={() => {
+                            setTimeout(() => setShowSuggestions(false), 200);
+                          }}
+                          className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
+                        />
+
+                        {/* Auto-suggest suggestions list */}
+                        {showSuggestions && suggestions.length > 0 && (
+                          <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[220px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
+                            {suggestions.map((suggestion, idx) => (
+                              <button
+                                key={`guest-suggest-${idx}`}
+                                type="button"
+                                onClick={() => handleSelectSuggestion(suggestion)}
+                                className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
+                              >
+                                <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                <span className="truncate">{suggestion}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <button
                         type="submit"
-                        className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1 cursor-pointer"
+                        className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1 cursor-pointer shrink-0"
                       >
                         <Search className="w-3.5 h-3.5" />
                         <span>Search</span>
@@ -1463,6 +1952,20 @@ export default function SingRoomKtv() {
                   </div>
                 )}
 
+                {/* TAB B5: LOUNGE LIVE CHAT VIEW */}
+                {activeMobileTab === "chat" && (
+                  <div className="space-y-4 animate-fade-in">
+                    <LoungeChatBox
+                      chatMessages={chatMessages}
+                      chatInput={chatInput}
+                      setChatInput={setChatInput}
+                      sendChatMessage={sendChatMessage}
+                      sendChatReaction={sendChatReaction}
+                      nickname={nickname}
+                    />
+                  </div>
+                )}
+
               </div>
             )}
 
@@ -1479,6 +1982,335 @@ export default function SingRoomKtv() {
         </div>
       </footer>
 
+    </div>
+  );
+}
+
+export function VoiceControlCard({
+  isListening,
+  voiceStatus,
+  isTtsEnabled,
+  setIsTtsEnabled,
+  toggleListening,
+  voiceLog,
+  className = ""
+}: {
+  isListening: boolean;
+  voiceStatus: string;
+  isTtsEnabled: boolean;
+  setIsTtsEnabled: (val: boolean) => void;
+  toggleListening: () => void;
+  voiceLog: { text: string; isCommand: boolean }[];
+  className?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className={`bg-slate-900/40 border ${isListening ? "border-cyan-500/40" : "border-slate-800"} rounded-3xl p-5 shadow-lg space-y-4 transition-all ${className}`}>
+      <div className="flex items-center justify-between">
+        <button
+          onClick={() => setIsOpen(!isOpen)}
+          className="flex items-center gap-2 cursor-pointer group text-left flex-1"
+        >
+          <div className={`w-8 h-8 rounded-lg ${isListening ? "bg-cyan-500/20 text-cyan-400" : "bg-slate-950 text-slate-400"} flex items-center justify-center transition-all group-hover:scale-105`}>
+            {isListening ? (
+              <Mic className="w-4.5 h-4.5 animate-pulse" />
+            ) : (
+              <Mic className="w-4.5 h-4.5" />
+            )}
+          </div>
+          <div>
+            <h4 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
+              <span>Voice Control Assistant</span>
+              {isListening && (
+                <span className="flex h-2 w-2 relative">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
+                </span>
+              )}
+            </h4>
+            <p className="text-[10px] text-slate-400 font-sans mt-0.5">
+              Trigger skip, pause, play, or search songs with your voice
+            </p>
+          </div>
+        </button>
+
+        <div className="flex items-center gap-2">
+          {/* TTS Toggle Button */}
+          <button
+            onClick={() => setIsTtsEnabled(!isTtsEnabled)}
+            className={`w-8 h-8 rounded-lg border flex items-center justify-center transition-all cursor-pointer ${
+              isTtsEnabled 
+                ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/20 hover:bg-indigo-500/20" 
+                : "bg-slate-950 text-slate-500 border-slate-850 hover:bg-slate-900"
+            }`}
+            title={isTtsEnabled ? "Disable Voice Responses" : "Enable Voice Responses"}
+          >
+            {isTtsEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+          </button>
+
+          {/* Expand Toggle */}
+          <button
+            onClick={() => setIsOpen(!isOpen)}
+            className="text-xs text-slate-400 hover:text-white underline decoration-slate-600 underline-offset-4 cursor-pointer font-mono font-bold"
+          >
+            {isOpen ? "Collapse" : "Setup / Help"}
+          </button>
+        </div>
+      </div>
+
+      {/* Main Microphone Button Area */}
+      <div className="flex flex-col sm:flex-row items-center gap-4 bg-slate-950/60 p-4 rounded-2xl border border-slate-850">
+        <button
+          onClick={toggleListening}
+          className={`w-14 h-14 rounded-full flex items-center justify-center shrink-0 cursor-pointer transition-all active:scale-95 ${
+            isListening
+              ? "bg-cyan-500 text-black shadow-[0_0_20px_rgba(34,211,238,0.4)] hover:bg-cyan-400"
+              : "bg-slate-900 hover:bg-slate-850 text-slate-300 border border-slate-800"
+          }`}
+        >
+          {isListening ? (
+            <div className="relative">
+              <Mic className="w-6 h-6 animate-pulse" />
+              <div className="absolute -inset-1 rounded-full border border-cyan-400 animate-ping opacity-30" />
+            </div>
+          ) : (
+            <MicOff className="w-6 h-6 text-slate-400" />
+          )}
+        </button>
+
+        <div className="min-w-0 flex-1 space-y-1.5 w-full text-center sm:text-left">
+          <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500 font-bold">
+            Assistant Status
+          </div>
+          <div className={`text-xs font-bold font-mono truncate leading-snug ${isListening ? "text-cyan-400" : "text-slate-300"}`}>
+            {voiceStatus}
+          </div>
+          {isListening && (
+            <div className="flex items-center gap-1 justify-center sm:justify-start">
+              <span className="w-1 h-3 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
+              <span className="w-1 h-4 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0.3s' }} />
+              <span className="w-1 h-2 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0.5s' }} />
+              <span className="w-1 h-4 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
+              <span className="w-1 h-3 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {isOpen && (
+        <div className="space-y-4 pt-2 border-t border-slate-850 animate-fade-in text-left">
+          {/* List of supported commands */}
+          <div className="space-y-1.5">
+            <h5 className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400">
+              🎤 Voice Command Cheat Sheet
+            </h5>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-850 space-y-1">
+                <div className="text-[10px] font-bold text-white flex items-center gap-1.5">
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"skip"</span>
+                  <span>or</span>
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"next"</span>
+                </div>
+                <p className="text-[9px] text-slate-500 leading-normal">
+                  Advances immediately to the next track in the queue.
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-850 space-y-1">
+                <div className="text-[10px] font-bold text-white flex items-center gap-1.5">
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"pause"</span>
+                  <span>or</span>
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"stop"</span>
+                </div>
+                <p className="text-[9px] text-slate-500 leading-normal">
+                  Pauses the currently active karaoke video.
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-850 space-y-1">
+                <div className="text-[10px] font-bold text-white flex items-center gap-1.5">
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"play"</span>
+                  <span>or</span>
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"resume"</span>
+                </div>
+                <p className="text-[9px] text-slate-500 leading-normal">
+                  Resumes playing the current karaoke track.
+                </p>
+              </div>
+
+              <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-850 space-y-1">
+                <div className="text-[10px] font-bold text-white flex items-center gap-1.5">
+                  <span className="bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-mono text-[9px]">"queue [song name]"</span>
+                </div>
+                <p className="text-[9px] text-slate-500 leading-normal">
+                  Searches YouTube and adds the first karaoke match.
+                </p>
+              </div>
+            </div>
+            <p className="text-[9px] text-slate-500 leading-relaxed pt-1 italic">
+              * Note: You can also say "sing [song]" or "play [song]" to search and queue. Examples: "queue Hello", "sing Bohemian Rhapsody".
+            </p>
+          </div>
+
+          {/* Rolling voice logs */}
+          {voiceLog.length > 0 && (
+            <div className="space-y-1.5 pt-2 border-t border-slate-850">
+              <h5 className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1">
+                <span>Rolling Voice Log</span>
+                <span className="text-[8px] text-slate-600">(last 5 entries)</span>
+              </h5>
+              <div className="bg-slate-950 border border-slate-850 rounded-xl p-2.5 max-h-[100px] overflow-y-auto space-y-1 divide-y divide-slate-900/60 font-mono text-[9px]">
+                {voiceLog.slice(0, 5).map((log, index) => (
+                  <div key={`log-${index}`} className="pt-1 first:pt-0 flex items-start gap-1.5 text-slate-400">
+                    <span className="text-slate-600 select-none">›</span>
+                    <span className={log.isCommand ? "text-indigo-400 font-bold" : "text-slate-400"}>
+                      {log.text}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function LoungeChatBox({
+  chatMessages,
+  chatInput,
+  setChatInput,
+  sendChatMessage,
+  sendChatReaction,
+  nickname
+}: {
+  chatMessages: any[];
+  chatInput: string;
+  setChatInput: (val: string) => void;
+  sendChatMessage: (textStr?: string) => void;
+  sendChatReaction: (emoji: string) => void;
+  nickname: string;
+}) {
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    sendChatMessage();
+  };
+
+  const REACTION_EMOJIS = ["🎉", "👏", "🔥", "🎙️", "❤️", "🌟"];
+
+  return (
+    <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg flex flex-col h-[400px]">
+      <div className="flex items-center justify-between border-b border-slate-800 pb-2.5 mb-3 select-none">
+        <div>
+          <h4 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
+            <MessageSquare className="w-4 h-4 text-cyan-400" />
+            <span>Lounge Live Chat</span>
+          </h4>
+          <p className="text-[10px] text-slate-400 mt-1 font-sans">
+            Real-time messages and short emoji reactions!
+          </p>
+        </div>
+        <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-slate-500 shrink-0">
+          LIVE STREAM
+        </span>
+      </div>
+
+      {/* Message List Area */}
+      <div className="flex-1 overflow-y-auto space-y-2 pr-1 mb-3 scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent">
+        {chatMessages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-center p-4">
+            <MessageSquare className="w-8 h-8 text-slate-700 mb-2 animate-pulse" />
+            <p className="text-xs text-slate-500 font-mono">No messages in this session yet.</p>
+            <p className="text-[10px] text-slate-600 font-sans mt-0.5">Be the first to say hello or drop a reaction!</p>
+          </div>
+        ) : (
+          chatMessages.map((msg) => {
+            const isMe = msg.sender === nickname;
+            const isSystem = msg.type === "system" || msg.sender === "System";
+            const isCheer = msg.type === "cheer";
+
+            if (isSystem || isCheer) {
+              return (
+                <div key={msg.id} className="text-center py-1 font-mono text-[10px]">
+                  <span className="inline-block bg-slate-950/80 border border-slate-850/60 px-2.5 py-1 rounded-full text-indigo-300 shadow-sm leading-normal">
+                    {msg.text}
+                  </span>
+                </div>
+              );
+            }
+
+            return (
+              <div
+                key={msg.id}
+                className={`flex flex-col max-w-[85%] ${isMe ? "ml-auto items-end" : "mr-auto items-start"}`}
+              >
+                <div className="flex items-center gap-1.5 mb-0.5 px-1">
+                  <span className="text-[9px] font-bold text-slate-400 font-mono">
+                    @{msg.sender}
+                  </span>
+                  <span className="text-[8px] text-slate-600 font-mono">{msg.timestamp}</span>
+                </div>
+                <div
+                  className={`px-3 py-2 rounded-2xl text-xs font-sans break-all shadow-sm leading-relaxed ${
+                    isMe
+                      ? "bg-gradient-to-br from-cyan-500/20 to-indigo-500/20 text-cyan-100 border border-cyan-500/30 rounded-tr-none"
+                      : "bg-slate-950 border border-slate-850 text-slate-200 rounded-tl-none"
+                  }`}
+                >
+                  {msg.text}
+                </div>
+              </div>
+            );
+          })
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Quick Reaction Tray */}
+      <div className="border-t border-slate-800/60 pt-2.5 mb-3 flex items-center justify-between gap-2">
+        <span className="text-[9px] font-mono font-bold text-slate-500 uppercase tracking-wider select-none shrink-0">
+          Reactions:
+        </span>
+        <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5">
+          {REACTION_EMOJIS.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              onClick={() => sendChatReaction(emoji)}
+              className="text-lg hover:scale-125 hover:-translate-y-0.5 transition-all active:scale-90 cursor-pointer p-1 rounded-lg hover:bg-slate-950 border border-transparent hover:border-slate-850"
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Input Tray */}
+      <form onSubmit={handleSubmit} className="flex gap-2">
+        <input
+          type="text"
+          placeholder="Say something to the group..."
+          value={chatInput}
+          onChange={(e) => setChatInput(e.target.value)}
+          maxLength={150}
+          className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs placeholder-slate-600 text-white focus:outline-none focus:border-cyan-500"
+        />
+        <button
+          type="submit"
+          disabled={!chatInput.trim()}
+          className="w-9 h-9 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:hover:bg-cyan-500 text-black flex items-center justify-center transition-all active:scale-95 shrink-0 cursor-pointer"
+        >
+          <Send className="w-4 h-4" />
+        </button>
+      </form>
     </div>
   );
 }

@@ -274,6 +274,30 @@ app.post("/api/party-rooms/join", (req, res) => {
   res.json(room);
 });
 
+app.get("/api/youtube/suggest", async (req, res) => {
+  const query = req.query.q as string;
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return res.json([]);
+  }
+
+  try {
+    const url = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(query.trim())}`;
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+      }
+    });
+    const data = await response.json();
+    if (Array.isArray(data) && data[1]) {
+      return res.json(data[1]);
+    }
+    res.json([]);
+  } catch (error) {
+    console.error("YouTube suggestions proxy error:", error);
+    res.json([]);
+  }
+});
+
 app.get("/api/youtube/search", async (req, res) => {
   let query = req.query.q as string;
   if (!query || typeof query !== "string" || !query.trim()) {
