@@ -4,8 +4,8 @@
  */
 
 import React from "react";
-import SingRoomKtv from "./components/SingRoomKtv";
+import MyKaraoke from "./components/MyKaraoke";
 
 export default function App() {
-  return <SingRoomKtv />;
+  return <MyKaraoke />;
 }

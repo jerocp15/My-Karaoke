@@ -30,9 +30,14 @@ import {
   AlertCircle,
   History,
   MessageSquare,
-  Send
+  Send,
+  Lock,
+  Video,
+  VideoOff,
+  ShieldAlert
 } from "lucide-react";
 import { SingRoomParty, YTPlaylistItem } from "../types";
+import VoiceEnhancerCard from "./VoiceEnhancerCard";
 
 export const SOUND_EFFECTS = [
   { id: "applause", name: "Applause", emoji: "👏", url: "https://assets.mixkit.co/active_storage/sfx/1435/1435-84.wav" },
@@ -168,7 +173,7 @@ interface FloatingEmoji {
   x: number;
 }
 
-export default function SingRoomKtv() {
+export default function MyKaraoke() {
   // Navigation & Join State
   const [room, setRoom] = useState<SingRoomParty | null>(null);
   const [roomIdInput, setRoomIdInput] = useState("");
@@ -221,7 +226,7 @@ export default function SingRoomKtv() {
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
   const [copiedCode, setCopiedCode] = useState(false);
-  const [activeMobileTab, setActiveMobileTab] = useState<"search" | "queue" | "sounds" | "history" | "chat">("search");
+  const [activeMobileTab, setActiveMobileTab] = useState<"search" | "queue" | "enhancer" | "history" | "chat">("search");
   const [floatingEmojis, setFloatingEmojis] = useState<FloatingEmoji[]>([]);
 
   // Chat States
@@ -503,6 +508,193 @@ export default function SingRoomKtv() {
   // WebSocket Ref
   const socketRef = useRef<WebSocket | null>(null);
   const playerRef = useRef<any>(null);
+  const guestPlayerRef = useRef<any>(null);
+  const hostContainerRef = useRef<HTMLDivElement>(null);
+  const guestContainerRef = useRef<HTMLDivElement>(null);
+  const [isGuestStreamEnabled, setIsGuestStreamEnabled] = useState(true);
+  const [isGuestStreamMuted, setIsGuestStreamMuted] = useState(true);
+
+  // Camera & Video Call States
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [cameraState, setCameraState] = useState<"off" | "on" | "error">("off");
+  const [isCameraMuted, setIsCameraMuted] = useState(false);
+  const [cameraDisabledNotification, setCameraDisabledNotification] = useState<string | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [remoteFrames, setRemoteFrames] = useState<Record<string, string>>({});
+
+  // Capture local stream frame and send to remote peers
+  useEffect(() => {
+    if (!localStream || !room) {
+      return;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 160;
+    canvas.height = 120;
+    const ctx = canvas.getContext("2d");
+
+    const sendFrame = () => {
+      if (!localVideoRef.current || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+      if (localVideoRef.current.readyState >= 1 || localVideoRef.current.videoWidth > 0) {
+        try {
+          ctx?.drawImage(localVideoRef.current, 0, 0, 160, 120);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.35); // highly compressed to fit comfortably in WebSocket payloads
+          socketRef.current.send(
+            JSON.stringify({
+              type: "party-camera-frame",
+              roomId: room.id,
+              userId,
+              frame: dataUrl
+            })
+          );
+        } catch (e) {
+          console.error("Error drawing/sending camera frame:", e);
+        }
+      }
+    };
+
+    // Send immediately and then every 300ms
+    sendFrame();
+    const intervalId = setInterval(sendFrame, 300);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [localStream, room?.id, userId]);
+
+  // Clean up remote frames for members who turned off their camera
+  useEffect(() => {
+    if (room?.members) {
+      setRemoteFrames((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        Object.keys(next).forEach((key) => {
+          const m = room.members.find((member) => member.id === key);
+          if (!m || !m.cameraOn) {
+            delete next[key];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }
+  }, [room?.members]);
+
+  // Monitor Host Disabling User's Camera
+  useEffect(() => {
+    if (room && userId) {
+      const me = room.members.find(m => m.id === userId);
+      if (me && me.cameraForceDisabledByHost && localStream) {
+        // Stop all tracks of localStream
+        try {
+          localStream.getTracks().forEach((track) => track.stop());
+        } catch (e) {}
+        setLocalStream(null);
+        setCameraState("off");
+        
+        // Notify user elegantly
+        setCameraDisabledNotification("The host has disabled your camera stream.");
+        setTimeout(() => setCameraDisabledNotification(null), 5000);
+
+        // Notify server that our camera is now disabled
+        socketRef.current?.send(
+          JSON.stringify({
+            type: "party-toggle-camera",
+            roomId: room.id,
+            userId,
+            enabled: false,
+            isMuted: true
+          })
+        );
+      }
+    }
+  }, [room?.members, userId, localStream]);
+
+  // Handle local video element source binding when localStream is active
+  useEffect(() => {
+    if (localVideoRef.current) {
+      if (localStream) {
+        localVideoRef.current.srcObject = localStream;
+      } else {
+        localVideoRef.current.srcObject = null;
+      }
+    }
+  }, [localStream, cameraState]);
+
+  const toggleLocalCamera = async () => {
+    if (!room) return;
+
+    // Check if the host has blocked our camera
+    const me = room.members.find(m => m.id === userId);
+    if (me?.cameraForceDisabledByHost) {
+      setCameraDisabledNotification("The host has disabled your camera. You cannot turn it on.");
+      setTimeout(() => setCameraDisabledNotification(null), 4000);
+      return;
+    }
+
+    if (localStream) {
+      // Turn Off
+      try {
+        localStream.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      setLocalStream(null);
+      setCameraState("off");
+
+      socketRef.current?.send(
+        JSON.stringify({
+          type: "party-toggle-camera",
+          roomId: room.id,
+          userId,
+          enabled: false,
+          isMuted: true
+        })
+      );
+    } else {
+      // Turn On
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 320, height: 240, facingMode: "user" },
+          audio: false // Set to false to avoid echo feedback, or change if desired
+        });
+        setLocalStream(stream);
+        setCameraState("on");
+
+        socketRef.current?.send(
+          JSON.stringify({
+            type: "party-toggle-camera",
+            roomId: room.id,
+            userId,
+            enabled: true,
+            isMuted: isCameraMuted
+          })
+        );
+      } catch (err) {
+        console.error("Failed to access camera:", err);
+        setCameraState("error");
+        // Fallback: simulate camera on server so we can participate in the call!
+        socketRef.current?.send(
+          JSON.stringify({
+            type: "party-toggle-camera",
+            roomId: room.id,
+            userId,
+            enabled: true,
+            isMuted: isCameraMuted
+          })
+        );
+      }
+    }
+  };
+
+  const hostDisableGuestCamera = (targetUserId: string) => {
+    if (!room || !socketRef.current) return;
+    socketRef.current.send(
+      JSON.stringify({
+        type: "party-force-disable-camera",
+        roomId: room.id,
+        targetUserId
+      })
+    );
+  };
 
   // Parse direct join from URL parameter e.g. /?room=ABCDE
   useEffect(() => {
@@ -510,6 +702,45 @@ export default function SingRoomKtv() {
     const roomParam = params.get("room") || params.get("join");
     if (roomParam && roomParam.length === 5) {
       setRoomIdInput(roomParam.toUpperCase());
+    }
+  }, []);
+
+  // Auto-restore room session on refresh
+  useEffect(() => {
+    const savedRoomCode = localStorage.getItem("singroom_active_room_code");
+    const savedNickname = localStorage.getItem("singroom_nickname") || nickname;
+    const savedIsHost = localStorage.getItem("singroom_is_host_role") === "true";
+
+    if (savedRoomCode && savedNickname && savedRoomCode.length === 5) {
+      console.log(`[AutoRestore] Attempting to rejoin room ${savedRoomCode} as nickname ${savedNickname}`);
+      
+      const restoreRoom = async () => {
+        try {
+          const response = await fetch("/api/party-rooms/join", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              code: savedRoomCode.toUpperCase().trim(),
+              name: savedNickname.trim()
+            })
+          });
+
+          const data = await response.json();
+          if (response.ok) {
+            setIsHostRole(savedIsHost);
+            setRoom(data);
+            console.log(`[AutoRestore] Rejoined room successfully:`, data);
+          } else {
+            console.warn("[AutoRestore] Room no longer active on server. Clearing saved session.");
+            localStorage.removeItem("singroom_active_room_code");
+            localStorage.removeItem("singroom_is_host_role");
+          }
+        } catch (err) {
+          console.error("[AutoRestore] Error auto-rejoining room:", err);
+        }
+      };
+
+      restoreRoom();
     }
   }, []);
 
@@ -553,6 +784,32 @@ export default function SingRoomKtv() {
         } else if (data.type === "party-playback-updated") {
           const { action, value } = data;
           handleRemotePlayerAction(action, value);
+        } else if (data.type === "party-time-sync") {
+          const { time } = data;
+          const isCurrentUserHost = roomRef.current?.hostId === userId || isHostRole;
+          if (!isCurrentUserHost && guestPlayerRef.current) {
+            try {
+              // Self-healing play/pause check
+              if (typeof guestPlayerRef.current.getPlayerState === "function") {
+                const guestState = guestPlayerRef.current.getPlayerState();
+                if (roomRef.current?.isPlaying && guestState !== 1 && guestState !== 3) {
+                  guestPlayerRef.current.playVideo();
+                } else if (!roomRef.current?.isPlaying && guestState === 1) {
+                  guestPlayerRef.current.pauseVideo();
+                }
+              }
+
+              // Drastic-free low-latency sync alignment
+              if (typeof guestPlayerRef.current.getCurrentTime === "function") {
+                const guestTime = guestPlayerRef.current.getCurrentTime();
+                if (guestTime !== undefined && Math.abs(guestTime - time) > 1.0) {
+                  guestPlayerRef.current.seekTo(time, true);
+                }
+              }
+            } catch (e) {
+              console.error("Error aligning guest player:", e);
+            }
+          }
         } else if (data.type === "party-sound-effect") {
           const { soundId, userName } = data;
           const effect = SOUND_EFFECTS.find((s) => s.id === soundId);
@@ -578,6 +835,14 @@ export default function SingRoomKtv() {
           if (isCurrentUserHost && text.trim().length <= 6 && /\p{Extended_Pictographic}/u.test(text)) {
             triggerFloatingEmoji(text.trim(), data.message.sender, "Chat Reaction");
           }
+        } else if (data.type === "party-camera-frame") {
+          const { userId: senderUserId, frame } = data;
+          setRemoteFrames((prev) => ({ ...prev, [senderUserId]: frame }));
+        } else if (data.type === "party-disbanded") {
+          setErrorMsg("The Host has ended the party and closed this SingRoom.");
+          setRoom(null);
+          localStorage.removeItem("singroom_active_room_code");
+          localStorage.removeItem("singroom_is_host_role");
         }
       } catch (err) {
         console.error("[SingRoom WS Error] parsing message:", err);
@@ -603,12 +868,20 @@ export default function SingRoomKtv() {
 
   // Remote action listener for YouTube Player
   const handleRemotePlayerAction = (action: string, value: any) => {
-    if (!playerRef.current) return;
     try {
-      if (action === "play") {
-        playerRef.current.playVideo();
-      } else if (action === "pause") {
-        playerRef.current.pauseVideo();
+      if (playerRef.current) {
+        if (action === "play") {
+          playerRef.current.playVideo();
+        } else if (action === "pause") {
+          playerRef.current.pauseVideo();
+        }
+      }
+      if (guestPlayerRef.current) {
+        if (action === "play") {
+          guestPlayerRef.current.playVideo();
+        } else if (action === "pause") {
+          guestPlayerRef.current.pauseVideo();
+        }
       }
     } catch (e) {
       console.error("Error manipulating remote player:", e);
@@ -666,17 +939,27 @@ export default function SingRoomKtv() {
     };
 
     loadYoutubeAPI(() => {
+      // Reuse existing player if available to prevent browser autoplay blocks
       if (playerRef.current && typeof playerRef.current.loadVideoById === "function") {
-        playerRef.current.loadVideoById({
-          videoId: room.activeSong?.videoId,
-          startSeconds: 0
-        });
-        if (room.isPlaying) {
-          playerRef.current.playVideo();
-        } else {
-          playerRef.current.pauseVideo();
+        try {
+          playerRef.current.loadVideoById({
+            videoId: room.activeSong?.videoId,
+            startSeconds: 0
+          });
+          if (room.isPlaying) {
+            playerRef.current.playVideo();
+          } else {
+            playerRef.current.pauseVideo();
+          }
+          return;
+        } catch (e) {
+          console.error("Error loading video in existing host player:", e);
         }
-        return;
+      }
+
+      // Recreate the target div in the container to bypass YouTube API bugs if creating player from scratch
+      if (hostContainerRef.current) {
+        hostContainerRef.current.innerHTML = '<div id="youtube-player-host" class="w-full h-full"></div>';
       }
 
       // Create new player
@@ -703,6 +986,24 @@ export default function SingRoomKtv() {
             if (event.data === 0) {
               console.log("[YT Player] Video ended, advancing queue...");
               playbackControl("next");
+            } else if (event.data === 1 || event.data === 2) {
+              // Immediately send a time sync when play/pause occurs to align all guests instantly
+              try {
+                if (playerRef.current && typeof playerRef.current.getCurrentTime === "function") {
+                  const time = playerRef.current.getCurrentTime();
+                  if (time !== undefined && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                    socketRef.current.send(
+                      JSON.stringify({
+                        type: "party-time-sync",
+                        roomId: room?.id,
+                        time
+                      })
+                    );
+                  }
+                }
+              } catch (e) {
+                console.error("Error sending instant time sync on state change:", e);
+              }
             }
           }
         }
@@ -723,6 +1024,188 @@ export default function SingRoomKtv() {
       } catch (e) {}
     }
   }, [room?.isPlaying]);
+
+  // Host periodic playback progress broadcaster
+  useEffect(() => {
+    if (!room) return;
+    const isCurrentUserHost = room.hostId === userId || isHostRole;
+    if (!isCurrentUserHost) return;
+
+    const intervalId = setInterval(() => {
+      try {
+        if (roomRef.current?.isPlaying && playerRef.current && typeof playerRef.current.getCurrentTime === "function") {
+          const time = playerRef.current.getCurrentTime();
+          if (time !== undefined && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+            socketRef.current.send(
+              JSON.stringify({
+                type: "party-time-sync",
+                roomId: roomRef.current.id,
+                time
+              })
+            );
+          }
+        }
+      } catch (e) {
+        console.error("Error broadcasting time sync:", e);
+      }
+    }, 1000);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [room?.id, isHostRole]);
+
+  // YouTube Player for Guests (Streaming active song screen in sync with the room)
+  useEffect(() => {
+    if (!room) return;
+    const isCurrentUserHost = room.hostId === userId || isHostRole;
+    if (isCurrentUserHost) {
+      if (guestPlayerRef.current) {
+        try {
+          guestPlayerRef.current.destroy();
+        } catch (e) {}
+        guestPlayerRef.current = null;
+      }
+      return;
+    }
+
+    if (!isGuestStreamEnabled || !room.activeSong) {
+      if (guestPlayerRef.current) {
+        try {
+          guestPlayerRef.current.destroy();
+        } catch (e) {}
+        guestPlayerRef.current = null;
+      }
+      return;
+    }
+
+    const loadYoutubeAPI = (callback: () => void) => {
+      if ((window as any).YT && (window as any).YT.Player) {
+        callback();
+        return;
+      }
+
+      if (!(window as any).onYouTubeIframeAPIReady) {
+        (window as any).onYouTubeIframeAPIReady = () => {
+          callback();
+        };
+      } else {
+        const existing = (window as any).onYouTubeIframeAPIReady;
+        (window as any).onYouTubeIframeAPIReady = () => {
+          existing();
+          callback();
+        };
+      }
+
+      if (!document.getElementById("yt-iframe-api-script")) {
+        const tag = document.createElement("script");
+        tag.id = "yt-iframe-api-script";
+        tag.src = "https://www.youtube.com/iframe_api";
+        const firstScriptTag = document.getElementsByTagName("script")[0];
+        firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+      }
+    };
+
+    loadYoutubeAPI(() => {
+      // Reuse existing player if available to prevent browser autoplay blocks
+      if (guestPlayerRef.current && typeof guestPlayerRef.current.loadVideoById === "function") {
+        try {
+          guestPlayerRef.current.loadVideoById({
+            videoId: room.activeSong?.videoId,
+            startSeconds: 0
+          });
+          
+          if (isGuestStreamMuted) {
+            guestPlayerRef.current.mute();
+          } else {
+            guestPlayerRef.current.unMute();
+          }
+
+          if (room.isPlaying) {
+            guestPlayerRef.current.playVideo();
+          } else {
+            guestPlayerRef.current.pauseVideo();
+          }
+          return;
+        } catch (e) {
+          console.error("Error loading video in existing guest player:", e);
+        }
+      }
+
+      // Recreate the target div in the container to bypass YouTube API iframe substitution bugs if creating player from scratch
+      if (guestContainerRef.current) {
+        guestContainerRef.current.innerHTML = '<div id="youtube-player-guest" class="w-full h-full"></div>';
+      }
+
+      // Create new guest player
+      try {
+        guestPlayerRef.current = new (window as any).YT.Player("youtube-player-guest", {
+          height: "100%",
+          width: "100%",
+          videoId: room.activeSong?.videoId,
+          playerVars: {
+            autoplay: room.isPlaying ? 1 : 0,
+            controls: 0, // Guest player doesn't have controls to prevent local tampering
+            modestbranding: 1,
+            rel: 0,
+            disablekb: 1,
+            fs: 0
+          },
+          events: {
+            onReady: (event: any) => {
+              if (isGuestStreamMuted) {
+                event.target.mute();
+              } else {
+                event.target.unMute();
+              }
+
+              if (room.isPlaying) {
+                event.target.playVideo();
+              } else {
+                event.target.pauseVideo();
+              }
+            }
+          }
+        });
+      } catch (err) {
+        console.error("Error creating guest player:", err);
+      }
+    });
+  }, [room?.activeSong?.videoId, room?.hostId, isGuestStreamEnabled]);
+
+  // Sync isPlaying state to Guest YouTube Player
+  useEffect(() => {
+    const isCurrentUserHost = room ? room.hostId === userId || isHostRole : false;
+    if (isCurrentUserHost) return;
+
+    if (guestPlayerRef.current && typeof guestPlayerRef.current.getPlayerState === "function") {
+      try {
+        const state = guestPlayerRef.current.getPlayerState();
+        if (room?.isPlaying && state !== 1) {
+          guestPlayerRef.current.playVideo();
+        } else if (!room?.isPlaying && state === 1) {
+          guestPlayerRef.current.pauseVideo();
+        }
+      } catch (e) {}
+    }
+  }, [room?.isPlaying]);
+
+  // Sync mute state to Guest YouTube Player
+  useEffect(() => {
+    if (guestPlayerRef.current) {
+      try {
+        if (isGuestStreamMuted) {
+          if (typeof guestPlayerRef.current.mute === "function") {
+            guestPlayerRef.current.mute();
+          }
+        } else {
+          if (typeof guestPlayerRef.current.unMute === "function") {
+            guestPlayerRef.current.unMute();
+          }
+        }
+      } catch (e) {}
+    }
+  }, [isGuestStreamMuted]);
 
   // API Call: Create Room
   const createRoom = async (e: React.FormEvent) => {
@@ -752,6 +1235,8 @@ export default function SingRoomKtv() {
 
       setIsHostRole(true);
       setRoom(data);
+      localStorage.setItem("singroom_active_room_code", data.id);
+      localStorage.setItem("singroom_is_host_role", "true");
       setSuccessMsg(`Welcome, Host! Room "${data.name}" was successfully launched.`);
     } catch (err: any) {
       setErrorMsg(err.message || "Could not spin up a new room.");
@@ -786,6 +1271,8 @@ export default function SingRoomKtv() {
 
       setIsHostRole(false);
       setRoom(data);
+      localStorage.setItem("singroom_active_room_code", data.id);
+      localStorage.setItem("singroom_is_host_role", "false");
       setSuccessMsg(`Joined room "${data.name}" successfully!`);
       setIsQrJoin(false);
       try {
@@ -799,7 +1286,23 @@ export default function SingRoomKtv() {
   };
 
   // Exit/Leave current room
-  const leaveRoom = () => {
+  const leaveRoom = async () => {
+    const activeCode = room?.id || localStorage.getItem("singroom_active_room_code");
+    if (activeCode) {
+      try {
+        await fetch("/api/party-rooms/leave", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: activeCode,
+            userId: userId
+          })
+        });
+      } catch (err) {
+        console.error("Failed to notify leave room API:", err);
+      }
+    }
+
     if (socketRef.current) {
       socketRef.current.close();
     }
@@ -809,6 +1312,8 @@ export default function SingRoomKtv() {
     setErrorMsg("");
     setSuccessMsg("");
     setIsHostRole(false);
+    localStorage.removeItem("singroom_active_room_code");
+    localStorage.removeItem("singroom_is_host_role");
   };
 
   // API Call: YouTube Search
@@ -927,6 +1432,198 @@ export default function SingRoomKtv() {
     navigator.clipboard.writeText(url);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const renderLoungeVideoCall = () => {
+    if (!room) return null;
+
+    return (
+      <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+        {/* Header bar of the Video Call Lounge */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="relative">
+              <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
+                <Video className="w-4.5 h-4.5" />
+              </div>
+              {room.members.some(m => m.cameraOn) && (
+                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                </span>
+              )}
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>Lounge Video Call</span>
+                <span className="text-[10px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full">
+                  {room.members.filter(m => m.cameraOn).length} On Cam
+                </span>
+              </h3>
+              <p className="text-[11px] text-slate-400 leading-none mt-0.5">
+                Real-time video hangouts inside the SingRoom
+              </p>
+            </div>
+          </div>
+
+          {/* Local Action controls */}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={toggleLocalCamera}
+              disabled={room.members.find(m => m.id === userId)?.cameraForceDisabledByHost}
+              className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
+                room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
+                  ? "bg-slate-850 text-slate-600 border border-slate-800/80 cursor-not-allowed"
+                  : localStream
+                  ? "bg-rose-500/10 text-rose-400 border border-rose-500/30 hover:bg-rose-500/20"
+                  : "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20"
+              }`}
+              title={
+                room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
+                  ? "Disabled by Host"
+                  : localStream
+                  ? "Stop Camera"
+                  : "Start Camera"
+              }
+            >
+              {localStream ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+              <span>{localStream ? "Stop Camera" : "Start Camera"}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Floating Warning for disabled camera */}
+        {cameraDisabledNotification && (
+          <div className="bg-rose-500/15 border border-rose-500/30 text-rose-400 rounded-xl px-4 py-2.5 text-xs flex items-center gap-2 animate-pulse">
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span>{cameraDisabledNotification}</span>
+          </div>
+        )}
+
+        {/* Video Grid */}
+        <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+          {room.members.map((member) => {
+            const isMe = member.id === userId;
+            const isHostUser = member.id === room.hostId || member.isHost;
+            const hasCam = member.cameraOn;
+            const isForceDisabled = member.cameraForceDisabledByHost;
+
+            return (
+              <div
+                key={member.id + "-videocall"}
+                className={`relative rounded-xl border aspect-video overflow-hidden transition-all group flex flex-col justify-between ${
+                  hasCam 
+                    ? "bg-slate-950 border-cyan-500/40 shadow-lg shadow-cyan-950/20" 
+                    : "bg-slate-950 border-slate-800/80 hover:border-slate-700/60"
+                }`}
+              >
+                {/* Video Area */}
+                <div className="absolute inset-0 z-0">
+                  {hasCam ? (
+                    isMe ? (
+                      /* Real live webcam for current user */
+                      <video
+                        ref={(el) => {
+                          localVideoRef.current = el;
+                          if (el && localStream) {
+                            el.srcObject = localStream;
+                          }
+                        }}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full h-full object-cover scale-x-[-1]"
+                      />
+                    ) : remoteFrames[member.id] ? (
+                      /* Real live stream from the remote user! */
+                      <img
+                        src={remoteFrames[member.id]}
+                        alt={`@${member.name}'s video`}
+                        className="w-full h-full object-cover scale-x-[-1]"
+                      />
+                    ) : (
+                      /* Polished Live Simulated Streams for Remote Users with responsive visual feedback */
+                      <div className="w-full h-full flex flex-col items-center justify-center relative overflow-hidden bg-gradient-to-b from-slate-950 via-cyan-950/20 to-slate-950">
+                        {/* High fidelity scanning grids */}
+                        <div className="absolute inset-0 opacity-10 bg-[linear-gradient(to_right,#808080_1px,transparent_1px),linear-gradient(to_bottom,#808080_1px,transparent_1px)] bg-[size:14px_24px] pointer-events-none" />
+                        
+                        {/* Active waveform pulsating feedback */}
+                        <div className="flex items-center gap-1 mb-2">
+                          <span className="w-1 h-4 bg-cyan-400/80 rounded animate-[pulse_1s_infinite_alternate]" />
+                          <span className="w-1 h-6 bg-cyan-400 rounded animate-[pulse_0.7s_infinite_alternate]" style={{ animationDelay: '150ms' }} />
+                          <span className="w-1 h-5 bg-cyan-400/90 rounded animate-[pulse_0.8s_infinite_alternate]" style={{ animationDelay: '300ms' }} />
+                          <span className="w-1 h-3 bg-cyan-400/60 rounded animate-[pulse_1.2s_infinite_alternate]" style={{ animationDelay: '450ms' }} />
+                        </div>
+
+                        {/* Styled camera lens overlay */}
+                        <div className="w-10 h-10 rounded-full border border-cyan-500/30 flex items-center justify-center relative animate-pulse">
+                          <span className="w-3.5 h-3.5 rounded-full bg-cyan-400/20 border border-cyan-400/60 flex items-center justify-center">
+                            <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full" />
+                          </span>
+                        </div>
+                        
+                        {/* Status text overlay */}
+                        <div className="absolute top-2 right-2 flex items-center gap-1 text-[8px] font-mono uppercase bg-cyan-950/80 text-cyan-400 px-1 py-0.5 rounded border border-cyan-500/20 tracking-wider">
+                          <span className="w-1 h-1 bg-cyan-400 rounded-full animate-ping" />
+                          <span>CONNECTING</span>
+                        </div>
+                      </div>
+                    )
+                  ) : (
+                    /* Camera is Off */
+                    <div className="w-full h-full flex flex-col items-center justify-center bg-slate-950 relative">
+                      {isForceDisabled ? (
+                        <div className="w-8 h-8 rounded-full bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 mb-1.5">
+                          <ShieldAlert className="w-4 h-4" />
+                        </div>
+                      ) : (
+                        <div className="w-8 h-8 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-400 mb-1.5 font-bold font-mono text-xs uppercase">
+                          {member.name.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
+                      
+                      <span className="text-[9px] text-slate-500 font-mono tracking-wide">
+                        {isForceDisabled ? "Blocked by Host" : "Camera Off"}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Info and action ribbon overlay */}
+                <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-slate-950 via-slate-950/90 to-transparent p-2 pt-5 z-10 flex items-center justify-between">
+                  <div className="min-w-0 flex flex-col">
+                    <span className="text-[11px] font-bold text-slate-200 truncate flex items-center gap-1">
+                      {isMe ? "You" : `@${member.name}`}
+                      {isHostUser && (
+                        <span className="text-[8px] font-bold font-mono uppercase bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1 py-0.2 rounded scale-90">
+                          Host
+                        </span>
+                      )}
+                    </span>
+                  </div>
+
+                  {/* Remote management trigger for the Host! */}
+                  {room.hostId === userId && !isMe && (
+                    <button
+                      onClick={() => hostDisableGuestCamera(member.id)}
+                      disabled={isForceDisabled || !hasCam}
+                      className={`p-1 rounded-md transition-all active:scale-95 cursor-pointer ${
+                        isForceDisabled || !hasCam
+                          ? "bg-slate-800/40 text-slate-600 border border-slate-900/40 cursor-not-allowed"
+                          : "bg-rose-500/10 text-rose-400 border border-rose-500/20 hover:bg-rose-500 hover:text-white"
+                      }`}
+                      title={isForceDisabled ? "Already Disabled" : "Turn Off Guest Camera"}
+                    >
+                      <VideoOff className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
   };
 
   const isCurrentUserHost = room ? room.hostId === userId || isHostRole : false;
@@ -1219,7 +1916,9 @@ export default function SingRoomKtv() {
                     
                     {room.activeSong ? (
                       /* Active song video placeholder for IFrame API */
-                      <div id="youtube-player-host" className="w-full h-full" />
+                      <div ref={hostContainerRef} className="w-full h-full">
+                        <div id="youtube-player-host" className="w-full h-full" />
+                      </div>
                     ) : (
                       /* Idle Monitor */
                       <div className="absolute inset-0 flex flex-col items-center justify-center p-8 text-center space-y-4 bg-gradient-to-b from-slate-950 to-slate-900/50">
@@ -1322,46 +2021,12 @@ export default function SingRoomKtv() {
                       </div>
                     )}
                   </div>
+                  
+                  {/* LOUNGE VIDEO CALL GRIID FOR ALL ACTIVE PARTICIPANTS */}
+                  {renderLoungeVideoCall()}
 
-                  {/* ROOM SOUND CARD (SOUNDBOARD) */}
-                  <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
-                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b border-slate-800 pb-2.5 gap-2">
-                      <div>
-                        <h4 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
-                          <Sparkles className="w-4 h-4 text-cyan-400" />
-                          <span>Room Soundboard (Sound Card)</span>
-                        </h4>
-                        <p className="text-[10px] text-slate-400 mt-1">
-                          Tap any sound effect to play it instantly on your TV speakers with synchronized visual overlays.
-                        </p>
-                      </div>
-                      <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-slate-500 self-start sm:self-auto">
-                        SYNCED REMOTE LIVE
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
-                      {SOUND_EFFECTS.map((effect) => (
-                        <button
-                          key={effect.id}
-                          onClick={() => sendSoundEffect(effect.id)}
-                          className="flex flex-col items-center justify-center p-3.5 rounded-2xl bg-slate-950 border border-slate-850 hover:border-cyan-500/50 hover:bg-slate-900/40 transition-all active:scale-95 group cursor-pointer text-center"
-                        >
-                          <span className="text-3xl group-hover:scale-115 transition-transform mb-1.5 select-none">{effect.emoji}</span>
-                          <span className="text-[11px] font-extrabold text-slate-300 group-hover:text-cyan-400 transition-colors truncate w-full">{effect.name}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* STAGE VOICE CONTROL ASSISTANT */}
-                  <VoiceControlCard
-                    isListening={isListening}
-                    voiceStatus={voiceStatus}
-                    isTtsEnabled={isTtsEnabled}
-                    setIsTtsEnabled={setIsTtsEnabled}
-                    toggleListening={toggleListening}
-                    voiceLog={voiceLog}
-                  />
+                  {/* VOICE ENHANCER CARD FOR HOST */}
+                  <VoiceEnhancerCard />
 
                   {/* HOST CONTROLS & INFO BOARD */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1625,8 +2290,8 @@ export default function SingRoomKtv() {
               </div>
             ) : (
               
-              // CASE B: GUEST / MOBILE VIEW (OPTIMIZED FOR HAND-HELD CONTROLLER)
-              <div className="max-w-md mx-auto space-y-6">
+              // CASE B: GUEST / MOBILE VIEW (OPTIMIZED FOR BOTH HAND-HELD CONTROLLER AND DESKTOP GUESTS)
+              <div className="max-w-md md:max-w-6xl mx-auto space-y-6">
                 
                 {/* Lobby Info Stripe */}
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-lg flex items-center justify-between">
@@ -1644,317 +2309,584 @@ export default function SingRoomKtv() {
                   </span>
                 </div>
 
-                {/* STAGE VOICE CONTROL ASSISTANT */}
-                <VoiceControlCard
-                  isListening={isListening}
-                  voiceStatus={voiceStatus}
-                  isTtsEnabled={isTtsEnabled}
-                  setIsTtsEnabled={setIsTtsEnabled}
-                  toggleListening={toggleListening}
-                  voiceLog={voiceLog}
-                />
+                {/* LOUNGE VIDEO CALL FOR ALL ACTIVE PARTICIPANTS */}
+                {renderLoungeVideoCall()}
 
-                {/* Tab layout: Search Songs vs Active Queue vs Soundboard vs History vs Chat */}
-                <div className="grid grid-cols-5 bg-slate-950 p-1 rounded-xl border border-slate-800">
-                  <button
-                    onClick={() => setActiveMobileTab("search")}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
-                      activeMobileTab === "search" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <Search className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Search</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveMobileTab("queue")}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
-                      activeMobileTab === "queue" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <Users className="w-3.5 h-3.5" />
-                    <span>Queue ({room.queue.length})</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveMobileTab("sounds")}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
-                      activeMobileTab === "sounds" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Sounds</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveMobileTab("history")}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
-                      activeMobileTab === "history" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <History className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">History</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveMobileTab("chat")}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer relative ${
-                      activeMobileTab === "chat" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <div className="relative">
-                      <MessageSquare className="w-3.5 h-3.5" />
-                      {hasNewChat && (
-                        <span className="absolute -top-1 -right-1 flex h-2 w-2">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
-                          <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+                {/* 🖥️ LIVE ROOM STREAM CARD FOR GUESTS */}
+                {room.activeSong ? (
+                  <div className="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl space-y-3">
+                    {/* Header bar of the Stream */}
+                    <div className="bg-slate-950 px-5 py-3 border-b border-slate-800 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-2 w-2 relative">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
                         </span>
+                        <h3 className="text-[11px] font-mono font-bold tracking-wider text-red-400 uppercase">
+                          Lounge Screen Stream
+                        </h3>
+                      </div>
+                      
+                      {/* Controls for guest stream */}
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setIsGuestStreamMuted(!isGuestStreamMuted)}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                            isGuestStreamMuted 
+                              ? "bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20" 
+                              : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20"
+                          }`}
+                          title={isGuestStreamMuted ? "Unmute Stream Audio" : "Mute Stream Audio"}
+                        >
+                          {isGuestStreamMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                          <span>{isGuestStreamMuted ? "Muted" : "Audio On"}</span>
+                        </button>
+
+                        <button
+                          onClick={() => setIsGuestStreamEnabled(!isGuestStreamEnabled)}
+                          className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-slate-800 border border-slate-700/60 text-slate-300 hover:text-white transition-all flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Tv className="w-3.5 h-3.5" />
+                          <span>{isGuestStreamEnabled ? "Hide Video" : "Show Video"}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Stream display section */}
+                    <div className="p-4 pt-1 space-y-3">
+                      {isGuestStreamEnabled ? (
+                        <div className="bg-slate-950 border border-slate-850 rounded-2xl overflow-hidden aspect-video relative">
+                          <div ref={guestContainerRef} className="w-full h-full">
+                            <div id="youtube-player-guest" className="w-full h-full" />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-slate-950/45 border border-slate-850 rounded-2xl p-4 flex items-center gap-3.5">
+                          <img
+                            src={room.activeSong.thumbnail}
+                            alt="Now playing"
+                            className="w-16 h-16 rounded-xl object-cover border border-slate-800 shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <span className="inline-block text-[9px] font-mono uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/10 px-2 py-0.5 rounded font-bold">
+                              Now Singing
+                            </span>
+                            <h4 className="text-xs font-bold text-slate-400 line-clamp-1 mt-1 leading-snug">
+                              {room.activeSong.title}
+                            </h4>
+                            <p className="text-[10px] text-slate-500 mt-0.5">
+                              Added by <span className="text-slate-400 font-semibold">@{room.activeSong.queuedBy}</span>
+                            </p>
+                          </div>
+                        </div>
                       )}
-                    </div>
-                    <span>Chat</span>
-                  </button>
-                </div>
 
-                {/* NOW PLAYING CARD AT TOP */}
-                {room.activeSong && (
-                  <div className="bg-indigo-950/20 border border-indigo-500/20 rounded-2xl p-4 flex items-center gap-3 shadow-md">
-                    <img
-                      src={room.activeSong.thumbnail}
-                      alt="Now playing"
-                      className="w-12 h-12 rounded-xl object-cover border border-slate-800 shrink-0 animate-pulse"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <span className="inline-block text-[9px] font-mono uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/10 px-2 py-0.5 rounded font-bold">
-                        Now Singing
-                      </span>
-                      <h4 className="text-xs font-extrabold text-white line-clamp-1 mt-1 leading-snug">
-                        {room.activeSong.title}
-                      </h4>
-                      <p className="text-[10px] text-slate-400 mt-0.5">
-                        Added by @{room.activeSong.queuedBy}
-                      </p>
-                    </div>
-                  </div>
-                )}
+                      {/* Guest Playback Control Bar */}
+                      <div className="bg-slate-950/80 rounded-2xl p-3 border border-slate-850 flex flex-col sm:flex-row items-center justify-between gap-3">
+                        <div className="flex items-center gap-2.5 min-w-0 w-full sm:w-auto">
+                          <div className="w-8 h-8 rounded-lg bg-indigo-500/10 flex items-center justify-center text-indigo-400 shrink-0">
+                            <Music className="w-4 h-4" />
+                          </div>
+                          <div className="min-w-0">
+                            <h4 className="text-xs font-bold text-slate-200 line-clamp-1">
+                              {room.activeSong.title}
+                            </h4>
+                            <p className="text-[10px] text-slate-400 mt-0.5">
+                              Queued by <span className="text-cyan-400 font-semibold">@{room.activeSong.queuedBy}</span>
+                            </p>
+                          </div>
+                        </div>
 
-                {/* TAB B1: SEARCH VIEW */}
-                {activeMobileTab === "search" && (
-                  <div className="space-y-4 animate-fade-in">
-                    <form onSubmit={searchSongs} className="flex gap-2 relative">
-                      <div className="relative flex-1">
-                        <input
-                          type="text"
-                          placeholder="Search YouTube track (e.g. Queen)"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          onFocus={() => setShowSuggestions(true)}
-                          onBlur={() => {
-                            setTimeout(() => setShowSuggestions(false), 200);
-                          }}
-                          className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
-                        />
-
-                        {/* Auto-suggest suggestions list */}
-                        {showSuggestions && suggestions.length > 0 && (
-                          <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[220px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
-                            {suggestions.map((suggestion, idx) => (
-                              <button
-                                key={`guest-suggest-${idx}`}
-                                type="button"
-                                onClick={() => handleSelectSuggestion(suggestion)}
-                                className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
-                              >
-                                <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
-                                <span className="truncate">{suggestion}</span>
-                              </button>
-                            ))}
+                        {/* Control Buttons */}
+                        {room.activeSong.queuedBy === nickname ? (
+                          <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
+                            <span className="text-[9px] font-mono font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/10">
+                              Your Track
+                            </span>
+                            <button
+                              onClick={() => playbackControl(room.isPlaying ? "pause" : "play")}
+                              className="px-3 py-1.5 bg-cyan-500 hover:bg-cyan-400 text-black text-xs font-bold rounded-lg transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
+                              title={room.isPlaying ? "Pause Song" : "Play Song"}
+                            >
+                              {room.isPlaying ? <Pause className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+                              <span>{room.isPlaying ? "Pause" : "Play"}</span>
+                            </button>
+                            <button
+                              onClick={() => playbackControl("next")}
+                              className="px-3 py-1.5 bg-slate-850 hover:bg-slate-800 text-white text-xs font-bold rounded-lg border border-slate-750 transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
+                              title="Skip Song"
+                            >
+                              <SkipForward className="w-3.5 h-3.5" />
+                              <span>Skip</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
+                            <span className="text-[10px] font-mono font-medium text-slate-500 bg-slate-950/80 px-2 py-1.5 rounded-lg border border-slate-850 flex items-center gap-1 w-full sm:w-auto justify-center">
+                              <Lock className="w-3.5 h-3.5 text-slate-600" />
+                              <span>Only @{room.activeSong.queuedBy} can control this track</span>
+                            </span>
                           </div>
                         )}
                       </div>
-                      <button
-                        type="submit"
-                        className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1 cursor-pointer shrink-0"
-                      >
-                        <Search className="w-3.5 h-3.5" />
-                        <span>Search</span>
-                      </button>
-                    </form>
 
-                    {/* Search results loading indicator */}
-                    {isSearching && (
-                      <div className="py-12 text-center text-xs text-slate-500 font-mono flex flex-col items-center gap-2">
-                        <span className="w-5 h-5 rounded-full border-2 border-cyan-400/20 border-t-cyan-400 animate-spin" />
-                        <span>Retrieving high-fidelity YouTube search results...</span>
+                      {/* Info and helper disclaimer below the video player */}
+                      <div className="flex items-center justify-between bg-slate-950/50 rounded-xl px-3 py-2 border border-slate-850 text-[10px] text-slate-400 font-mono">
+                        <span className="truncate max-w-[70%]">
+                          🎵 {room.activeSong.title}
+                        </span>
+                        <span className="shrink-0 text-slate-500">
+                          {isGuestStreamMuted ? "🔇 Audio muted (no echo)" : "🔊 Audio active"}
+                        </span>
                       </div>
-                    )}
-
-                    {/* Search Results Cards */}
-                    {!isSearching && searchResults.length > 0 && (
-                      <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
-                        {searchResults.map((song) => (
-                          <div
-                            key={song.videoId}
-                            className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl hover:border-slate-700 transition-all group"
-                          >
-                            <div className="flex items-center gap-2.5 min-w-0">
-                              <img
-                                src={song.thumbnail}
-                                alt={song.title}
-                                className="w-12 h-12 rounded-xl object-cover border border-slate-800 shrink-0"
-                              />
-                              <div className="min-w-0">
-                                <h4 className="text-xs font-bold text-white line-clamp-2 leading-snug">
-                                  {song.title}
-                                </h4>
-                                <p className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">
-                                  {song.channelTitle}
-                                </p>
-                              </div>
-                            </div>
-
-                            <button
-                              onClick={() => addSongToQueue(song)}
-                              className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-all shrink-0 cursor-pointer"
-                            >
-                              Add to Queue
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {!isSearching && searchResults.length === 0 && (
-                      <div className="py-12 text-center text-xs text-slate-600 bg-slate-900/10 border border-slate-900 rounded-2xl">
-                        <Music className="w-8 h-8 text-slate-800 mx-auto mb-2 animate-pulse" />
-                        <p>Search above to load real-time YouTube songs!</p>
-                        <p className="text-[10px] text-slate-700 mt-1">"karaoke" will automatically append for optimal sing-along lyrics.</p>
-                      </div>
-                    )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="bg-slate-900/35 border border-slate-800 rounded-3xl p-6 flex flex-col items-center justify-center text-center text-xs text-slate-500 font-mono gap-2">
+                    <Music className="w-6 h-6 text-slate-700 animate-pulse" />
+                    <span className="font-semibold text-slate-400">Lounge Screen Idle</span>
+                    <span className="text-[10px] text-slate-600">No tracks are currently playing. Search and queue a song below!</span>
                   </div>
                 )}
 
-                {/* TAB B2: CURRENT QUEUE VIEW */}
-                {activeMobileTab === "queue" && (
-                  <div className="space-y-4 animate-fade-in">
-                    <h3 className="text-xs font-bold font-mono uppercase tracking-wide text-slate-400">
-                      Upcoming Songs ({room.queue.length})
-                    </h3>
+                {/* 1. MOBILE DEVICE TAB LAYOUT (Visible on mobile/small screens, hidden on md+) */}
+                <div className="block md:hidden space-y-6">
+                  {/* Tab layout selector */}
+                  <div className="grid grid-cols-5 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                    <button
+                      onClick={() => setActiveMobileTab("search")}
+                      className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+                        activeMobileTab === "search" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Search</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveMobileTab("queue")}
+                      className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+                        activeMobileTab === "queue" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Users className="w-3.5 h-3.5" />
+                      <span>Queue</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveMobileTab("enhancer")}
+                      className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+                        activeMobileTab === "enhancer" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Mic className="w-3.5 h-3.5" />
+                      <span>Voice</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveMobileTab("history")}
+                      className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+                        activeMobileTab === "history" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">History</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveMobileTab("chat")}
+                      className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer relative ${
+                        activeMobileTab === "chat" ? "bg-cyan-500 text-black shadow" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <div className="relative">
+                        <MessageSquare className="w-3.5 h-3.5" />
+                        {hasNewChat && (
+                          <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-500"></span>
+                          </span>
+                        )}
+                      </div>
+                      <span>Chat</span>
+                    </button>
+                  </div>
 
-                    <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
-                      {room.queue.length === 0 ? (
-                        <div className="py-12 text-center text-xs text-slate-600 border border-slate-900 rounded-2xl">
-                          <p>The queue is currently empty.</p>
-                          <p className="text-[10px] text-slate-700 mt-1">Be the first to search and add a song!</p>
+                  {/* TAB B1: SEARCH VIEW */}
+                  {activeMobileTab === "search" && (
+                    <div className="space-y-4 animate-fade-in">
+                      <form onSubmit={searchSongs} className="flex gap-2 relative">
+                        <div className="relative flex-1">
+                          <input
+                            type="text"
+                            placeholder="Search YouTube track (e.g. Queen)"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            onFocus={() => setShowSuggestions(true)}
+                            onBlur={() => {
+                              setTimeout(() => setShowSuggestions(false), 200);
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
+                          />
+
+                          {/* Auto-suggest suggestions list */}
+                          {showSuggestions && suggestions.length > 0 && (
+                            <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[220px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
+                              {suggestions.map((suggestion, idx) => (
+                                <button
+                                  key={`guest-suggest-mob-${idx}`}
+                                  type="button"
+                                  onClick={() => handleSelectSuggestion(suggestion)}
+                                  className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                  <span className="truncate">{suggestion}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
-                      ) : (
-                        room.queue.map((item, index) => (
-                          <div
-                            key={item.id}
-                            className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl"
-                          >
-                            <div className="flex items-center gap-2.5 min-w-0">
-                              <img
-                                src={item.thumbnail}
-                                alt={item.title}
-                                className="w-10 h-10 rounded-lg object-cover border border-slate-800 shrink-0"
-                              />
-                              <div className="min-w-0">
-                                <h4 className="text-xs font-bold text-white line-clamp-1">
-                                  {item.title}
-                                </h4>
-                                <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-                                  Queue Index: #{index + 1} • Added by @{item.queuedBy}
-                                </p>
-                              </div>
-                            </div>
-
-                            {/* Guests cannot delete or reorder, only view or delete their OWN song if they want (let's let them delete any for simple collab, or keep it read-only) */}
-                            {item.queuedBy === nickname && (
-                              <button
-                                onClick={() => removeSong(item.id)}
-                                className="p-1 hover:bg-rose-950 text-slate-400 hover:text-rose-400 rounded transition-colors cursor-pointer"
-                                title="Remove My Song"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* TAB B3: SOUNDBOARD / SOUND CARD */}
-                {activeMobileTab === "sounds" && (
-                  <div className="space-y-4 animate-fade-in">
-                    <div className="text-center p-3.5 bg-slate-900/35 border border-slate-800 rounded-2xl">
-                      <h3 className="text-xs font-bold font-mono uppercase tracking-wide text-cyan-400">
-                        Room Soundboard (Sound Card)
-                      </h3>
-                      <p className="text-[10px] text-slate-400 mt-1 font-sans">
-                        Tap any sound effect to play it instantly on the Host's big screen/TV speakers!
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2.5">
-                      {SOUND_EFFECTS.map((effect) => (
                         <button
-                          key={effect.id}
-                          onClick={() => sendSoundEffect(effect.id)}
-                          className="flex flex-col items-center justify-center p-4 rounded-2xl bg-slate-900 border border-slate-850 hover:border-cyan-500/40 hover:bg-slate-800/60 transition-all active:scale-95 group cursor-pointer text-center"
+                          type="submit"
+                          className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1 cursor-pointer shrink-0"
                         >
-                          <span className="text-3xl group-hover:scale-110 transition-transform mb-2 select-none">{effect.emoji}</span>
-                          <span className="text-[11px] font-extrabold text-slate-200 group-hover:text-cyan-400 transition-colors">{effect.name}</span>
+                          <Search className="w-3.5 h-3.5" />
+                          <span>Search</span>
                         </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                      </form>
 
-                {/* TAB B4: RECENTLY PLAYED VIEW */}
-                {activeMobileTab === "history" && (
-                  <div className="space-y-4 animate-fade-in">
-                    <h3 className="text-xs font-bold font-mono uppercase tracking-wide text-slate-400">
-                      Recently Played Songs ({room.history?.length || 0})
-                    </h3>
-
-                    <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
-                      {!room.history || room.history.length === 0 ? (
-                        <div className="py-12 text-center text-slate-600 border border-slate-900 rounded-2xl">
-                          <p>No songs have finished playing yet.</p>
-                          <p className="text-[10px] text-slate-700 mt-1">They will appear here once they are played or skipped!</p>
+                      {isSearching && (
+                        <div className="py-12 text-center text-xs text-slate-500 font-mono flex flex-col items-center gap-2">
+                          <span className="w-5 h-5 rounded-full border-2 border-cyan-400/20 border-t-cyan-400 animate-spin" />
+                          <span>Retrieving high-fidelity YouTube search results...</span>
                         </div>
-                      ) : (
-                        room.history.map((item, index) => (
-                          <div
-                            key={item.id + "-mobile-hist-" + index}
-                            className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl"
-                          >
-                            <div className="flex items-center gap-2.5 min-w-0">
-                              <img
-                                src={item.thumbnail}
-                                alt={item.title}
-                                className="w-10 h-10 rounded-lg object-cover border border-slate-800 shrink-0 opacity-75"
-                              />
-                              <div className="min-w-0">
-                                <h4 className="text-xs font-bold text-slate-200 line-clamp-1">
-                                  {item.title}
-                                </h4>
-                                <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-                                  Sung by @{item.queuedBy}
-                                </p>
+                      )}
+
+                      {!isSearching && searchResults.length > 0 && (
+                        <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
+                          {searchResults.map((song) => (
+                            <div
+                              key={song.videoId}
+                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl hover:border-slate-700 transition-all group"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={song.thumbnail}
+                                  alt={song.title}
+                                  className="w-12 h-12 rounded-xl object-cover border border-slate-800 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-xs font-bold text-white line-clamp-2 leading-snug">
+                                    {song.title}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">
+                                    {song.channelTitle}
+                                  </p>
+                                </div>
                               </div>
+
+                              <button
+                                onClick={() => addSongToQueue(song)}
+                                className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-all shrink-0 cursor-pointer"
+                              >
+                                Add to Queue
+                              </button>
                             </div>
-                            <span className="text-[10px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-emerald-500 shrink-0">
-                              Played
-                            </span>
-                          </div>
-                        ))
+                          ))}
+                        </div>
+                      )}
+
+                      {!isSearching && searchResults.length === 0 && (
+                        <div className="py-12 text-center text-xs text-slate-600 bg-slate-900/10 border border-slate-900 rounded-2xl">
+                          <Music className="w-8 h-8 text-slate-800 mx-auto mb-2 animate-pulse" />
+                          <p>Search above to load real-time YouTube songs!</p>
+                          <p className="text-[10px] text-slate-700 mt-1">"karaoke" will automatically append for optimal sing-along lyrics.</p>
+                        </div>
                       )}
                     </div>
-                  </div>
-                )}
+                  )}
 
-                {/* TAB B5: LOUNGE LIVE CHAT VIEW */}
-                {activeMobileTab === "chat" && (
-                  <div className="space-y-4 animate-fade-in">
+                  {/* TAB B2: CURRENT QUEUE VIEW */}
+                  {activeMobileTab === "queue" && (
+                    <div className="space-y-4 animate-fade-in">
+                      <h3 className="text-xs font-bold font-mono uppercase tracking-wide text-slate-400">
+                        Upcoming Songs ({room.queue.length})
+                      </h3>
+
+                      <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
+                        {room.queue.length === 0 ? (
+                          <div className="py-12 text-center text-xs text-slate-600 border border-slate-900 rounded-2xl">
+                            <p>The queue is currently empty.</p>
+                            <p className="text-[10px] text-slate-700 mt-1">Be the first to search and add a song!</p>
+                          </div>
+                        ) : (
+                          room.queue.map((item, index) => (
+                            <div
+                              key={item.id}
+                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={item.thumbnail}
+                                  alt={item.title}
+                                  className="w-10 h-10 rounded-lg object-cover border border-slate-800 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-xs font-bold text-white line-clamp-1">
+                                    {item.title}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                    Queue Index: #{index + 1} • Added by @{item.queuedBy}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {item.queuedBy === nickname && (
+                                <button
+                                  onClick={() => removeSong(item.id)}
+                                  className="p-1 hover:bg-rose-950 text-slate-400 hover:text-rose-400 rounded transition-colors cursor-pointer"
+                                  title="Remove My Song"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* TAB B3: VOICE ENHANCER VIEW */}
+                  {activeMobileTab === "enhancer" && (
+                    <div className="space-y-4 animate-fade-in">
+                      <VoiceEnhancerCard />
+                    </div>
+                  )}
+
+                  {/* TAB B4: RECENTLY PLAYED VIEW */}
+                  {activeMobileTab === "history" && (
+                    <div className="space-y-4 animate-fade-in">
+                      <h3 className="text-xs font-bold font-mono uppercase tracking-wide text-slate-400">
+                        Recently Played Songs ({room.history?.length || 0})
+                      </h3>
+
+                      <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
+                        {!room.history || room.history.length === 0 ? (
+                          <div className="py-12 text-center text-slate-600 border border-slate-900 rounded-2xl">
+                            <p>No songs have finished playing yet.</p>
+                            <p className="text-[10px] text-slate-700 mt-1">They will appear here once they are played or skipped!</p>
+                          </div>
+                        ) : (
+                          room.history.map((item, index) => (
+                            <div
+                              key={item.id + "-mobile-hist-" + index}
+                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={item.thumbnail}
+                                  alt={item.title}
+                                  className="w-10 h-10 rounded-lg object-cover border border-slate-800 shrink-0 opacity-75"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-xs font-bold text-slate-200 line-clamp-1">
+                                    {item.title}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                    Sung by @{item.queuedBy}
+                                  </p>
+                                </div>
+                              </div>
+                              <span className="text-[10px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-emerald-500 shrink-0">
+                                Played
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* TAB B5: LOUNGE LIVE CHAT VIEW */}
+                  {activeMobileTab === "chat" && (
+                    <div className="space-y-4 animate-fade-in">
+                      <LoungeChatBox
+                        chatMessages={chatMessages}
+                        chatInput={chatInput}
+                        setChatInput={setChatInput}
+                        sendChatMessage={sendChatMessage}
+                        sendChatReaction={sendChatReaction}
+                        nickname={nickname}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. DESKTOP / TABLET DASHBOARD LAYOUT (Visible on md+ screens, hidden on mobile) */}
+                <div className="hidden md:grid md:grid-cols-12 md:gap-6 items-start">
+                  
+                  {/* Left Column - Search and Upcoming Queue */}
+                  <div className="md:col-span-7 space-y-6">
+                    
+                    {/* Search Panel Card */}
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+                        <h3 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
+                          <Search className="w-4 h-4 text-cyan-400" />
+                          <span>Search YouTube Songs</span>
+                        </h3>
+                        <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-500">
+                          REMOTE ADD
+                        </span>
+                      </div>
+
+                      <form onSubmit={searchSongs} className="flex gap-2 relative">
+                        <div className="relative flex-1">
+                          <input
+                            type="text"
+                            placeholder="Search YouTube track (e.g. Queen)"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            onFocus={() => setShowSuggestions(true)}
+                            onBlur={() => {
+                              setTimeout(() => setShowSuggestions(false), 200);
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
+                          />
+
+                          {/* Auto-suggest suggestions list */}
+                          {showSuggestions && suggestions.length > 0 && (
+                            <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[220px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
+                              {suggestions.map((suggestion, idx) => (
+                                <button
+                                  key={`guest-suggest-desk-${idx}`}
+                                  type="button"
+                                  onClick={() => handleSelectSuggestion(suggestion)}
+                                  className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                  <span className="truncate">{suggestion}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="submit"
+                          className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                        >
+                          <Search className="w-3.5 h-3.5" />
+                          <span>Search</span>
+                        </button>
+                      </form>
+
+                      {isSearching && (
+                        <div className="py-12 text-center text-xs text-slate-500 font-mono flex flex-col items-center gap-2">
+                          <span className="w-5 h-5 rounded-full border-2 border-cyan-400/20 border-t-cyan-400 animate-spin" />
+                          <span>Searching YouTube channels...</span>
+                        </div>
+                      )}
+
+                      {!isSearching && searchResults.length > 0 && (
+                        <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+                          {searchResults.map((song) => (
+                            <div
+                              key={`desk-song-${song.videoId}`}
+                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl hover:border-slate-800 transition-all group"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={song.thumbnail}
+                                  alt={song.title}
+                                  className="w-12 h-12 rounded-xl object-cover border border-slate-850 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-xs font-bold text-white line-clamp-2 leading-snug group-hover:text-cyan-400 transition-colors">
+                                    {song.title}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">
+                                    {song.channelTitle}
+                                  </p>
+                                </div>
+                              </div>
+
+                              <button
+                                onClick={() => addSongToQueue(song)}
+                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl transition-all shrink-0 cursor-pointer"
+                              >
+                                Add to Queue
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {!isSearching && searchResults.length === 0 && (
+                        <div className="py-12 text-center text-xs text-slate-600 bg-slate-950 border border-slate-900 rounded-2xl">
+                          <Music className="w-8 h-8 text-slate-850 mx-auto mb-2" />
+                          <p>Enter a song or artist name to load YouTube karaoke tracks!</p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Upcoming Songs Queue Card */}
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+                        <h3 className="text-xs font-bold font-mono uppercase tracking-widest text-indigo-400 flex items-center gap-1.5">
+                          <Users className="w-4 h-4 text-indigo-400" />
+                          <span>Lounge Playlist Queue ({room.queue.length})</span>
+                        </h3>
+                        <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-500">
+                          CO-SINGER LIST
+                        </span>
+                      </div>
+
+                      <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+                        {room.queue.length === 0 ? (
+                          <div className="py-12 text-center text-xs text-slate-500 font-mono border border-slate-900/40 rounded-2xl">
+                            <p>No songs queued up currently.</p>
+                            <p className="text-[10px] text-slate-600 mt-1">Be the first to search and add a track above!</p>
+                          </div>
+                        ) : (
+                          room.queue.map((item, index) => (
+                            <div
+                              key={`desk-queue-${item.id}`}
+                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <img
+                                  src={item.thumbnail}
+                                  alt={item.title}
+                                  className="w-10 h-10 rounded-lg object-cover border border-slate-850 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-xs font-bold text-white line-clamp-1">
+                                    {item.title}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                    Position: #{index + 1} • Added by @{item.queuedBy}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {item.queuedBy === nickname && (
+                                <button
+                                  onClick={() => removeSong(item.id)}
+                                  className="p-1.5 hover:bg-rose-950 text-slate-400 hover:text-rose-400 rounded-lg transition-colors cursor-pointer"
+                                  title="Remove My Song"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                  </div>
+
+                  {/* Right Column - Soundboard, Chat & Recently Played */}
+                  <div className="md:col-span-5 space-y-6">
+                    
+                    {/* Live Lounge Chat Card */}
                     <LoungeChatBox
                       chatMessages={chatMessages}
                       chatInput={chatInput}
@@ -1963,10 +2895,60 @@ export default function SingRoomKtv() {
                       sendChatReaction={sendChatReaction}
                       nickname={nickname}
                     />
+
+                    {/* VOICE ENHANCER CARD FOR GUEST */}
+                    <VoiceEnhancerCard />
+
+                    {/* Recently Played History Card */}
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+                        <h3 className="text-xs font-bold font-mono uppercase tracking-widest text-emerald-400 flex items-center gap-1.5">
+                          <History className="w-4 h-4 text-emerald-400" />
+                          <span>History of Sung Songs ({room.history?.length || 0})</span>
+                        </h3>
+                      </div>
+
+                      <div className="space-y-2.5 max-h-[220px] overflow-y-auto pr-1">
+                        {!room.history || room.history.length === 0 ? (
+                          <div className="py-8 text-center text-xs text-slate-500 font-mono">
+                            <p>No songs have completed yet.</p>
+                          </div>
+                        ) : (
+                          room.history.map((item, index) => (
+                            <div
+                              key={`desk-hist-${item.id}-${index}`}
+                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-xl"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <img
+                                  src={item.thumbnail}
+                                  alt={item.title}
+                                  className="w-8 h-8 rounded-lg object-cover border border-slate-850 shrink-0 opacity-75"
+                                />
+                                <div className="min-w-0">
+                                  <h4 className="text-[11px] font-bold text-slate-300 line-clamp-1">
+                                    {item.title}
+                                  </h4>
+                                  <p className="text-[9px] text-slate-500 font-mono mt-0.5">
+                                    Sung by @{item.queuedBy}
+                                  </p>
+                                </div>
+                              </div>
+                              <span className="text-[9px] font-mono font-bold bg-slate-900 border border-slate-850/60 px-1.5 py-0.5 rounded text-emerald-500 shrink-0">
+                                Played
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
                   </div>
-                )}
+
+                </div>
 
               </div>
+
             )}
 
           </div>

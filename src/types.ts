@@ -133,8 +133,16 @@ export interface SingRoomParty {
   isPlaying: boolean;
   activeSong: YTPlaylistItem | null;
   queue: YTPlaylistItem[];
-  members: { id: string; name: string; isHost: boolean }[];
+  members: { 
+    id: string; 
+    name: string; 
+    isHost: boolean; 
+    cameraOn?: boolean; 
+    cameraForceDisabledByHost?: boolean; 
+    isMuted?: boolean; 
+  }[];
   history: YTPlaylistItem[];
+  lastActiveAt?: number;
 }
 
 

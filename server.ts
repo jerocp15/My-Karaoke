@@ -101,8 +101,16 @@ interface SingRoomParty {
   isPlaying: boolean;
   activeSong: YTPlaylistItem | null;
   queue: YTPlaylistItem[];
-  members: { id: string; name: string; isHost: boolean }[];
+  members: { 
+    id: string; 
+    name: string; 
+    isHost: boolean; 
+    cameraOn?: boolean; 
+    cameraForceDisabledByHost?: boolean; 
+    isMuted?: boolean; 
+  }[];
   history: YTPlaylistItem[];
+  lastActiveAt?: number;
 }
 
 const partyRooms: Record<string, SingRoomParty> = {};
@@ -272,6 +280,36 @@ app.post("/api/party-rooms/join", (req, res) => {
   }
 
   res.json(room);
+});
+
+app.post("/api/party-rooms/leave", (req, res) => {
+  const { code, userId } = req.body;
+  if (!code || !userId) {
+    return res.status(400).json({ error: "Room code and user ID are required." });
+  }
+
+  const cleanCode = code.toUpperCase().trim();
+  const room = partyRooms[cleanCode];
+  if (room) {
+    if (room.hostId === userId) {
+      console.log(`[SingRoom] Host explicitly left. Disbanding room ${cleanCode}`);
+      // Broadcast to room that the room is disbanded
+      broadcastToRoom(cleanCode, {
+        type: "party-disbanded"
+      });
+      delete partyRooms[cleanCode];
+    } else {
+      // Guest explicitly left
+      room.members = room.members.filter(m => m.id !== userId);
+      console.log(`[SingRoom] Guest ${userId} explicitly left room ${cleanCode}`);
+      broadcastToRoom(cleanCode, {
+        type: "party-updated",
+        room
+      });
+    }
+  }
+
+  res.json({ success: true });
 });
 
 app.get("/api/youtube/suggest", async (req, res) => {
@@ -1020,6 +1058,29 @@ wss.on("connection", (ws: WebSocket) => {
           const room = partyRooms[roomId];
           if (!room) return;
 
+          const connInfo = activeConnections.get(ws);
+          if (!connInfo) return;
+          const { memberId } = connInfo;
+          const isHost = room.hostId === memberId;
+          const sender = room.members.find(m => m.id === memberId);
+          const senderName = sender ? sender.name : "";
+
+          // Locate the song to check who queued it
+          let targetSong: YTPlaylistItem | null = null;
+          if (room.activeSong && room.activeSong.id === itemId) {
+            targetSong = room.activeSong;
+          } else {
+            targetSong = room.queue.find(item => item.id === itemId) || null;
+          }
+
+          if (!targetSong) return;
+
+          // Invited guest can ONLY remove songs they themselves queued
+          if (!isHost && targetSong.queuedBy !== senderName) {
+            console.log(`[WS party-remove-song Permission Denied] Guest ${senderName} tried to remove song "${targetSong.title}" queued by ${targetSong.queuedBy}`);
+            return;
+          }
+
           if (room.activeSong && room.activeSong.id === itemId) {
             if (room.queue.length > 0) {
               room.activeSong = room.queue.shift() || null;
@@ -1048,6 +1109,17 @@ wss.on("connection", (ws: WebSocket) => {
           const room = partyRooms[roomId];
           if (!room) return;
 
+          const connInfo = activeConnections.get(ws);
+          if (!connInfo) return;
+          const { memberId } = connInfo;
+          const isHost = room.hostId === memberId;
+
+          // Only the Host is allowed to reorder the playlist queue
+          if (!isHost) {
+            console.log(`[WS party-reorder-queue Permission Denied] Guest tried to reorder the queue.`);
+            return;
+          }
+
           room.queue = queue;
           console.log(`[WS party-reorder-queue] Room ${roomId}: Reordered queue`);
 
@@ -1065,7 +1137,22 @@ wss.on("connection", (ws: WebSocket) => {
           const room = partyRooms[roomId];
           if (!room) return;
 
-          console.log(`[WS party-playback-control] Room ${roomId}: Action=${action} Value=${value}`);
+          const connInfo = activeConnections.get(ws);
+          if (!connInfo) return;
+          const { memberId } = connInfo;
+          const isHost = room.hostId === memberId;
+          const sender = room.members.find(m => m.id === memberId);
+          const senderName = sender ? sender.name : "";
+
+          // Invited guest cannot stop/pause/skip the current playing song added by other participants
+          if (!isHost) {
+            if (!room.activeSong || room.activeSong.queuedBy !== senderName) {
+              console.log(`[WS party-playback-control Permission Denied] Guest ${senderName} tried to control playback but they did not queue the active song "${room.activeSong?.title || 'None'}"`);
+              return;
+            }
+          }
+
+          console.log(`[WS party-playback-control] Room ${roomId}: Action=${action} Value=${value} by ${senderName || 'Unknown'}`);
 
           if (action === "play") {
             room.isPlaying = true;
@@ -1116,6 +1203,75 @@ wss.on("connection", (ws: WebSocket) => {
             soundId,
             userName
           });
+          break;
+        }
+
+        case "party-toggle-camera": {
+          const { enabled, isMuted, userId } = data;
+          if (!roomId || !userId) return;
+          const room = partyRooms[roomId];
+          if (!room) return;
+          const member = room.members.find(m => m.id === userId);
+          if (member) {
+            member.cameraOn = enabled;
+            member.isMuted = isMuted;
+            if (enabled) {
+              member.cameraForceDisabledByHost = false;
+            }
+          }
+          broadcastToRoom(roomId, {
+            type: "party-updated",
+            room
+          });
+          break;
+        }
+
+        case "party-force-disable-camera": {
+          const { targetUserId } = data;
+          if (!roomId || !targetUserId) return;
+          const room = partyRooms[roomId];
+          if (!room) return;
+
+          const connInfo = activeConnections.get(ws);
+          if (!connInfo || room.hostId !== connInfo.memberId) {
+            console.log("[WS party-force-disable-camera Permission Denied]");
+            return;
+          }
+
+          const member = room.members.find(m => m.id === targetUserId);
+          if (member) {
+            member.cameraOn = false;
+            member.cameraForceDisabledByHost = true;
+            console.log(`[WS party-force-disable-camera] Room ${roomId}: Host disabled camera for ${member.name}`);
+          }
+
+          broadcastToRoom(roomId, {
+            type: "party-updated",
+            room
+          });
+          break;
+        }
+
+        case "party-camera-frame": {
+          const { frame, userId: senderUserId } = data;
+          if (!roomId || !senderUserId) return;
+          
+          // Broadcast frame to all users in the room
+          broadcastToRoom(roomId, {
+            type: "party-camera-frame",
+            userId: senderUserId,
+            frame
+          });
+          break;
+        }
+
+        case "party-time-sync": {
+          const { time } = data;
+          if (!roomId) return;
+          broadcastToRoom(roomId, {
+            type: "party-time-sync",
+            time
+          }, ws); // skip the sender
           break;
         }
       }
@@ -1203,20 +1359,12 @@ wss.on("connection", (ws: WebSocket) => {
           console.log(`[WS Close] User ${removedMember.name} left party room ${roomId}`);
 
           if (partyRoom.hostId === memberId) {
-            if (partyRoom.members.length > 0) {
-              partyRoom.hostId = partyRoom.members[0].id;
-              partyRoom.hostName = partyRoom.members[0].name;
-              partyRoom.members[0].isHost = true;
-              console.log(`[WS Close] Assigning new host: ${partyRoom.hostName}`);
-            } else {
-              partyRoom.hostId = "";
-              partyRoom.hostName = "";
-            }
+            console.log(`[WS Close] Host ${partyRoom.hostName} disconnected from party room ${roomId}. Retaining host ID for reconnection/refresh.`);
           }
 
           if (partyRoom.members.length === 0) {
-            console.log(`[WS Close] Cleaning up empty party room: ${roomId}`);
-            delete partyRooms[roomId];
+            console.log(`[WS Close] Party room ${roomId} is empty. Keeping it active for reconnections/guests.`);
+            partyRoom.lastActiveAt = Date.now();
           } else {
             broadcastToRoom(roomId, {
               type: "party-updated",
@@ -1255,6 +1403,19 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Periodic cleanup of inactive party rooms (older than 4 hours with 0 members)
+  setInterval(() => {
+    const now = Date.now();
+    const maxInactiveTime = 4 * 60 * 60 * 1000; // 4 hours
+    for (const code in partyRooms) {
+      const pRoom = partyRooms[code];
+      if (pRoom.members.length === 0 && pRoom.lastActiveAt && (now - pRoom.lastActiveAt > maxInactiveTime)) {
+        console.log(`[Cleanup] Deleting inactive party room: ${code}`);
+        delete partyRooms[code];
+      }
+    }
+  }, 15 * 60 * 1000); // run every 15 minutes
 
   // Bind the HTTP/WS server on port 3000
   server.listen(PORT, "0.0.0.0", () => {
