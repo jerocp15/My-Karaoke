@@ -58,13 +58,14 @@ export class AudioEngine {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     this.ctx = new AudioContextClass();
     
-    // Request microphone access
+    // Request microphone access optimized for high-fidelity vocals and singing
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      },
+        noiseSuppression: false, // Disabling aggressive speech gates to preserve singing sustain
+        autoGainControl: false,  // Disabling dynamics compression to keep raw performance range
+        latency: 0
+      } as any,
       video: false
     });
 

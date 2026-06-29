@@ -143,6 +143,7 @@ export interface SingRoomParty {
   }[];
   history: YTPlaylistItem[];
   lastActiveAt?: number;
+  skipVotes?: string[];
 }
 
 

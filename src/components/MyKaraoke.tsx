@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import {
   Mic,
@@ -34,7 +34,9 @@ import {
   Lock,
   Video,
   VideoOff,
-  ShieldAlert
+  ShieldAlert,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { SingRoomParty, YTPlaylistItem } from "../types";
 import VoiceEnhancerCard from "./VoiceEnhancerCard";
@@ -192,6 +194,9 @@ export default function MyKaraoke() {
   });
 
   // UI States
+  const [isSidebarHidden, setIsSidebarHidden] = useState(false);
+  const [isShareCardCollapsed, setIsShareCardCollapsed] = useState(false);
+  const [isControllerCardCollapsed, setIsControllerCardCollapsed] = useState(false);
   const [isQrJoin, setIsQrJoin] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get("room") || params.get("join");
@@ -228,11 +233,30 @@ export default function MyKaraoke() {
   const [copiedCode, setCopiedCode] = useState(false);
   const [activeMobileTab, setActiveMobileTab] = useState<"search" | "queue" | "enhancer" | "history" | "chat">("search");
   const [floatingEmojis, setFloatingEmojis] = useState<FloatingEmoji[]>([]);
+  const [socialHubTab, setSocialHubTab] = useState<"video" | "chat">("chat");
 
   // Chat States
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [hasNewChat, setHasNewChat] = useState(false);
+
+  // Play remote audio chunk with autoplay block handling
+  const playRemoteAudioChunk = useCallback((senderId: string, base64Audio: string) => {
+    // If the remote user is muted, do not play their audio chunk
+    const member = room?.members.find(m => m.id === senderId);
+    if (member?.isMuted) return;
+
+    try {
+      const audioObj = new Audio(base64Audio);
+      audioObj.volume = 0.85;
+      audioObj.play().catch((e) => {
+        // Autoplay policy might block it initially
+        console.warn("Autoplay blocked remote audio chunk:", e);
+      });
+    } catch (err) {
+      console.error("Error playing remote audio chunk:", err);
+    }
+  }, [room?.members]);
 
   const activeMobileTabRef = useRef(activeMobileTab);
   useEffect(() => {
@@ -509,6 +533,163 @@ export default function MyKaraoke() {
   const socketRef = useRef<WebSocket | null>(null);
   const playerRef = useRef<any>(null);
   const guestPlayerRef = useRef<any>(null);
+  const lastSyncedTimeRef = useRef<number>(0);
+  const previousVideoIdRef = useRef<string | undefined>(undefined);
+  const queueRestoredRef = useRef<Record<string, boolean>>({});
+  const [savedBackupCount, setSavedBackupCount] = useState(0);
+
+  // Local Backup & Restore of Karaoke Queue
+  // 1. Save queue and active song to localStorage when changed
+  useEffect(() => {
+    if (room?.id) {
+      try {
+        if (room.queue) {
+          localStorage.setItem(`singroom_queue_backup_${room.id}`, JSON.stringify(room.queue));
+        }
+        if (room.activeSong) {
+          localStorage.setItem(`singroom_activesong_backup_${room.id}`, JSON.stringify(room.activeSong));
+        } else {
+          localStorage.removeItem(`singroom_activesong_backup_${room.id}`);
+        }
+      } catch (err) {
+        console.error("Failed to back up queue/activeSong to localStorage:", err);
+      }
+    }
+  }, [room?.id, room?.queue, room?.activeSong]);
+
+  // 2. Track the count of backed-up queue items
+  useEffect(() => {
+    if (room?.id) {
+      try {
+        const savedQueueStr = localStorage.getItem(`singroom_queue_backup_${room.id}`);
+        const savedActiveStr = localStorage.getItem(`singroom_activesong_backup_${room.id}`);
+        let count = 0;
+        if (savedActiveStr) count += 1;
+        if (savedQueueStr) {
+          const q = JSON.parse(savedQueueStr);
+          count += q.length;
+        }
+        setSavedBackupCount(count);
+      } catch (e) {
+        setSavedBackupCount(0);
+      }
+    } else {
+      setSavedBackupCount(0);
+    }
+  }, [room?.id, room?.queue, room?.activeSong]);
+
+  // 3. Define the backup restoration function
+  const handleRestoreBackup = () => {
+    if (!room || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    const roomId = room.id;
+    try {
+      const savedQueueStr = localStorage.getItem(`singroom_queue_backup_${roomId}`);
+      const savedActiveStr = localStorage.getItem(`singroom_activesong_backup_${roomId}`);
+      
+      const savedQueue = savedQueueStr ? JSON.parse(savedQueueStr) : [];
+      const savedActive = savedActiveStr ? JSON.parse(savedActiveStr) : null;
+      
+      if (savedActive || savedQueue.length > 0) {
+        // Mark as restored for this session
+        queueRestoredRef.current[roomId] = true;
+        
+        if (savedActive) {
+          socketRef.current.send(
+            JSON.stringify({
+              type: "party-add-song",
+              roomId,
+              song: {
+                videoId: savedActive.videoId,
+                title: savedActive.title,
+                thumbnail: savedActive.thumbnail,
+                channelTitle: savedActive.channelTitle
+              },
+              queuedBy: savedActive.queuedBy || nickname || "Singer"
+            })
+          );
+          
+          if (savedQueue.length > 0) {
+            setTimeout(() => {
+              if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                socketRef.current.send(
+                  JSON.stringify({
+                    type: "party-reorder-queue",
+                    roomId,
+                    queue: savedQueue
+                  })
+                );
+              }
+            }, 400);
+          }
+        } else if (savedQueue.length > 0) {
+          const firstItem = savedQueue[0];
+          const remainingQueue = savedQueue.slice(1);
+          
+          socketRef.current.send(
+            JSON.stringify({
+              type: "party-add-song",
+              roomId,
+              song: {
+                videoId: firstItem.videoId,
+                title: firstItem.title,
+                thumbnail: firstItem.thumbnail,
+                channelTitle: firstItem.channelTitle
+              },
+              queuedBy: firstItem.queuedBy || nickname || "Singer"
+            })
+          );
+          
+          if (remainingQueue.length > 0) {
+            setTimeout(() => {
+              if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                socketRef.current.send(
+                  JSON.stringify({
+                    type: "party-reorder-queue",
+                    roomId,
+                    queue: remainingQueue
+                  })
+                );
+              }
+            }, 400);
+          }
+        }
+        setSuccessMsg("Successfully restored your previous karaoke queue!");
+        setTimeout(() => setSuccessMsg(""), 3000);
+      }
+    } catch (e) {
+      console.error("Error restoring backup queue:", e);
+      setErrorMsg("Failed to restore previous queue.");
+    }
+  };
+
+  // 4. Auto-restore the queue on initial connection if empty
+  useEffect(() => {
+    if (!room || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    
+    const isCurrentUserHost = room.hostId === userId || isHostRole;
+    if (!isCurrentUserHost) return;
+
+    const roomId = room.id;
+    if (queueRestoredRef.current[roomId]) return;
+
+    // Check if the current queue and active song are empty on the server
+    if (room.queue.length === 0 && !room.activeSong) {
+      const savedQueueStr = localStorage.getItem(`singroom_queue_backup_${roomId}`);
+      const savedActiveStr = localStorage.getItem(`singroom_activesong_backup_${roomId}`);
+      
+      if (savedQueueStr || savedActiveStr) {
+        // Prevent infinite loops by marking immediately
+        queueRestoredRef.current[roomId] = true;
+        
+        console.log(`[AutoRestoreQueue] Auto-restoring queue for room: ${roomId}`);
+        handleRestoreBackup();
+      }
+    } else {
+      // If server already has songs, consider it restored/active
+      queueRestoredRef.current[roomId] = true;
+    }
+  }, [room?.id, room?.queue?.length, room?.activeSong, isHostRole, userId]);
+
   const hostContainerRef = useRef<HTMLDivElement>(null);
   const guestContainerRef = useRef<HTMLDivElement>(null);
   const [isGuestStreamEnabled, setIsGuestStreamEnabled] = useState(true);
@@ -610,16 +791,100 @@ export default function MyKaraoke() {
     }
   }, [room?.members, userId, localStream]);
 
-  // Handle local video element source binding when localStream is active
-  useEffect(() => {
-    if (localVideoRef.current) {
+  // Callback ref to bind local stream cleanly and prevent video blinking on component re-renders
+  const setLocalVideoRef = useCallback((el: HTMLVideoElement | null) => {
+    localVideoRef.current = el;
+    if (el) {
       if (localStream) {
-        localVideoRef.current.srcObject = localStream;
+        if (el.srcObject !== localStream) {
+          el.srcObject = localStream;
+        }
       } else {
-        localVideoRef.current.srcObject = null;
+        el.srcObject = null;
       }
     }
-  }, [localStream, cameraState]);
+  }, [localStream]);
+
+  // Toggle microphone muting state for local camera stream
+  const toggleCameraMic = () => {
+    if (localStream) {
+      const audioTracks = localStream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const nextState = !audioTracks[0].enabled;
+        audioTracks[0].enabled = nextState;
+        setIsCameraMuted(!nextState);
+
+        socketRef.current?.send(
+          JSON.stringify({
+            type: "party-toggle-camera",
+            roomId: room?.id,
+            userId,
+            enabled: true,
+            isMuted: !nextState
+          })
+        );
+      } else {
+        setIsCameraMuted(!isCameraMuted);
+      }
+    } else {
+      setIsCameraMuted(!isCameraMuted);
+    }
+  };
+
+  // Capture local stream audio chunks and broadcast to peers
+  useEffect(() => {
+    if (!localStream || !room) {
+      return;
+    }
+
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      return;
+    }
+
+    let mediaRecorder: MediaRecorder | null = null;
+    try {
+      let options = { mimeType: "audio/webm;codecs=opus" };
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+        options = { mimeType: "audio/webm" };
+      }
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+        options = { mimeType: "" };
+      }
+
+      mediaRecorder = new MediaRecorder(localStream, options);
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0 && !isCameraMuted) {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64Audio = reader.result as string;
+            socketRef.current?.send(
+              JSON.stringify({
+                type: "party-audio-frame",
+                roomId: room.id,
+                userId,
+                audio: base64Audio
+              })
+            );
+          };
+          reader.readAsDataURL(event.data);
+        }
+      };
+
+      mediaRecorder.start(400); // 400ms slices for balanced low latency and performance
+    } catch (e) {
+      console.error("Error setting up MediaRecorder for voice chat:", e);
+    }
+
+    return () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        try {
+          mediaRecorder.stop();
+        } catch (e) {}
+      }
+    };
+  }, [localStream, room?.id, userId, isCameraMuted]);
 
   const toggleLocalCamera = async () => {
     if (!room) return;
@@ -651,11 +916,58 @@ export default function MyKaraoke() {
       );
     } else {
       // Turn On
+      let stream: MediaStream | null = null;
+      let errorToLog: any = null;
+
+      // Try 1: Both Video and Audio
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           video: { width: 320, height: 240, facingMode: "user" },
-          audio: false // Set to false to avoid echo feedback, or change if desired
+          audio: true
         });
+      } catch (err) {
+        console.warn("Could not acquire both video and audio. Trying video-only...", err);
+        errorToLog = err;
+      }
+
+      // Try 2: Video-only (no mic available or mic blocked)
+      if (!stream) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 320, height: 240, facingMode: "user" },
+            audio: false
+          });
+        } catch (err) {
+          console.warn("Could not acquire video-only. Trying audio-only...", err);
+          errorToLog = err;
+        }
+      }
+
+      // Try 3: Audio-only (no camera available or camera blocked)
+      if (!stream) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: false,
+            audio: true
+          });
+        } catch (err) {
+          console.warn("Could not acquire audio-only stream.", err);
+          errorToLog = err;
+        }
+      }
+
+      if (stream) {
+        // Apply current mute state to the audio tracks if any are present
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          audioTracks.forEach(track => {
+            track.enabled = !isCameraMuted;
+          });
+        } else {
+          // No audio tracks are available in this stream, keep mute status
+          setIsCameraMuted(true);
+        }
+
         setLocalStream(stream);
         setCameraState("on");
 
@@ -665,11 +977,11 @@ export default function MyKaraoke() {
             roomId: room.id,
             userId,
             enabled: true,
-            isMuted: isCameraMuted
+            isMuted: audioTracks.length === 0 || isCameraMuted
           })
         );
-      } catch (err) {
-        console.error("Failed to access camera:", err);
+      } else {
+        console.error("Failed to access camera/microphone after all fallback options:", errorToLog);
         setCameraState("error");
         // Fallback: simulate camera on server so we can participate in the call!
         socketRef.current?.send(
@@ -786,6 +1098,7 @@ export default function MyKaraoke() {
           handleRemotePlayerAction(action, value);
         } else if (data.type === "party-time-sync") {
           const { time } = data;
+          lastSyncedTimeRef.current = time;
           const isCurrentUserHost = roomRef.current?.hostId === userId || isHostRole;
           if (!isCurrentUserHost && guestPlayerRef.current) {
             try {
@@ -802,7 +1115,11 @@ export default function MyKaraoke() {
               // Drastic-free low-latency sync alignment
               if (typeof guestPlayerRef.current.getCurrentTime === "function") {
                 const guestTime = guestPlayerRef.current.getCurrentTime();
-                if (guestTime !== undefined && Math.abs(guestTime - time) > 1.0) {
+                // CRITICAL: Avoid seeking/syncing if the tab is hidden or minimized.
+                // Background tabs get heavily throttled, meaning getCurrentTime() lags behind or stays static,
+                // which causes constant seeking (stutter/looping audio).
+                // Let the audio play continuously at its own pace while hidden.
+                if (!document.hidden && guestTime !== undefined && Math.abs(guestTime - time) > 1.0) {
                   guestPlayerRef.current.seekTo(time, true);
                 }
               }
@@ -838,6 +1155,11 @@ export default function MyKaraoke() {
         } else if (data.type === "party-camera-frame") {
           const { userId: senderUserId, frame } = data;
           setRemoteFrames((prev) => ({ ...prev, [senderUserId]: frame }));
+        } else if (data.type === "party-audio-frame") {
+          const { userId: senderUserId, audio: base64Audio } = data;
+          if (senderUserId !== userId) {
+            playRemoteAudioChunk(senderUserId, base64Audio);
+          }
         } else if (data.type === "party-disbanded") {
           setErrorMsg("The Host has ended the party and closed this SingRoom.");
           setRoom(null);
@@ -1069,6 +1391,11 @@ export default function MyKaraoke() {
       return;
     }
 
+    if (previousVideoIdRef.current !== room?.activeSong?.videoId) {
+      lastSyncedTimeRef.current = 0;
+      previousVideoIdRef.current = room?.activeSong?.videoId;
+    }
+
     if (!isGuestStreamEnabled || !room.activeSong) {
       if (guestPlayerRef.current) {
         try {
@@ -1112,7 +1439,7 @@ export default function MyKaraoke() {
         try {
           guestPlayerRef.current.loadVideoById({
             videoId: room.activeSong?.videoId,
-            startSeconds: 0
+            startSeconds: lastSyncedTimeRef.current || 0
           });
           
           if (isGuestStreamMuted) {
@@ -1149,7 +1476,8 @@ export default function MyKaraoke() {
             modestbranding: 1,
             rel: 0,
             disablekb: 1,
-            fs: 0
+            fs: 0,
+            start: Math.floor(lastSyncedTimeRef.current || 0)
           },
           events: {
             onReady: (event: any) => {
@@ -1157,6 +1485,10 @@ export default function MyKaraoke() {
                 event.target.mute();
               } else {
                 event.target.unMute();
+              }
+
+              if (lastSyncedTimeRef.current) {
+                event.target.seekTo(lastSyncedTimeRef.current, true);
               }
 
               if (room.isPlaying) {
@@ -1206,6 +1538,33 @@ export default function MyKaraoke() {
       } catch (e) {}
     }
   }, [isGuestStreamMuted]);
+
+  // Synchronize and align Guest YouTube Player when the tab becomes active/visible again
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && room && guestPlayerRef.current) {
+        const isCurrentUserHost = room.hostId === userId || isHostRole;
+        if (!isCurrentUserHost) {
+          try {
+            if (lastSyncedTimeRef.current && typeof guestPlayerRef.current.seekTo === "function") {
+              console.log("[SingRoom VisSync] Tab focused, aligning guest player to:", lastSyncedTimeRef.current);
+              guestPlayerRef.current.seekTo(lastSyncedTimeRef.current, true);
+            }
+            if (room.isPlaying && typeof guestPlayerRef.current.playVideo === "function") {
+              guestPlayerRef.current.playVideo();
+            }
+          } catch (e) {
+            console.error("Error aligning guest player on visibility change:", e);
+          }
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [room, isHostRole, userId]);
 
   // API Call: Create Room
   const createRoom = async (e: React.FormEvent) => {
@@ -1427,6 +1786,18 @@ export default function MyKaraoke() {
     );
   };
 
+  // WS send helper for Vote to Skip
+  const voteToSkip = () => {
+    if (!socketRef.current || !room || !userId) return;
+    socketRef.current.send(
+      JSON.stringify({
+        type: "party-vote-skip",
+        roomId: room.id,
+        userId
+      })
+    );
+  };
+
   const copyRoomLink = () => {
     const url = `${window.location.origin}/?room=${room?.id}`;
     navigator.clipboard.writeText(url);
@@ -1434,63 +1805,117 @@ export default function MyKaraoke() {
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  const renderLoungeVideoCall = () => {
+  const renderLoungeVideoCall = (isEmbedded = false) => {
     if (!room) return null;
 
     return (
-      <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+      <div className={isEmbedded ? "space-y-4 flex flex-col flex-1" : "bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4"}>
         {/* Header bar of the Video Call Lounge */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
-          <div className="flex items-center gap-2.5">
-            <div className="relative">
-              <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
-                <Video className="w-4.5 h-4.5" />
+        {!isEmbedded ? (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="relative">
+                <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
+                  <Video className="w-4.5 h-4.5" />
+                </div>
+                {room.members.some(m => m.cameraOn) && (
+                  <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                  </span>
+                )}
               </div>
-              {room.members.some(m => m.cameraOn) && (
-                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
-                </span>
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span>Lounge Video Call</span>
+                  <span className="text-[10px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full">
+                    {room.members.filter(m => m.cameraOn).length} On Cam
+                  </span>
+                </h3>
+                <p className="text-[11px] text-slate-400 leading-none mt-0.5">
+                  Real-time video hangouts inside the SingRoom
+                </p>
+              </div>
+            </div>
+
+            {/* Local Action controls */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={toggleLocalCamera}
+                disabled={room.members.find(m => m.id === userId)?.cameraForceDisabledByHost}
+                className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
+                  room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
+                    ? "bg-slate-850 text-slate-600 border border-slate-800/80 cursor-not-allowed"
+                    : localStream
+                    ? "bg-rose-500/10 text-rose-400 border border-rose-500/30 hover:bg-rose-500/20"
+                    : "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20"
+                }`}
+                title={
+                  room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
+                    ? "Disabled by Host"
+                    : localStream
+                    ? "Stop Camera"
+                    : "Start Camera"
+                }
+              >
+                {localStream ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+                <span>{localStream ? "Stop Camera" : "Start Camera"}</span>
+              </button>
+
+              {localStream && (
+                <button
+                  onClick={toggleCameraMic}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
+                    isCameraMuted
+                      ? "bg-rose-500/10 text-rose-405 border border-rose-500/30 hover:bg-rose-500/20"
+                      : "bg-emerald-500/10 text-emerald-450 border border-emerald-500/30 hover:bg-emerald-500/20"
+                  }`}
+                  title={isCameraMuted ? "Unmute Microphone" : "Mute Microphone"}
+                >
+                  {isCameraMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                  <span>{isCameraMuted ? "Mic: Muted" : "Mic: Live"}</span>
+                </button>
               )}
             </div>
-            <div>
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <span>Lounge Video Call</span>
-                <span className="text-[10px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full">
-                  {room.members.filter(m => m.cameraOn).length} On Cam
-                </span>
-              </h3>
-              <p className="text-[11px] text-slate-400 leading-none mt-0.5">
-                Real-time video hangouts inside the SingRoom
-              </p>
+          </div>
+        ) : (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800/60 pb-3 mb-1">
+            <span className="text-[11px] font-mono font-bold text-slate-400 uppercase tracking-wider">
+              {room.members.filter(m => m.cameraOn).length} Participants on Camera
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={toggleLocalCamera}
+                disabled={room.members.find(m => m.id === userId)?.cameraForceDisabledByHost}
+                className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
+                  room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
+                    ? "bg-slate-850 text-slate-600 border border-slate-800/80 cursor-not-allowed"
+                    : localStream
+                    ? "bg-rose-500/10 text-rose-400 border border-rose-500/30 hover:bg-rose-500/20"
+                    : "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20"
+                }`}
+              >
+                {localStream ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+                <span>{localStream ? "Stop Camera" : "Turn My Camera On"}</span>
+              </button>
+
+              {localStream && (
+                <button
+                  onClick={toggleCameraMic}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
+                    isCameraMuted
+                      ? "bg-rose-500/10 text-rose-405 border border-rose-500/30 hover:bg-rose-500/20"
+                      : "bg-emerald-500/10 text-emerald-450 border border-emerald-500/30 hover:bg-emerald-500/20"
+                  }`}
+                  title={isCameraMuted ? "Unmute Microphone" : "Mute Microphone"}
+                >
+                  {isCameraMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                  <span>{isCameraMuted ? "Mic: Muted" : "Mic: Live"}</span>
+                </button>
+              )}
             </div>
           </div>
-
-          {/* Local Action controls */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={toggleLocalCamera}
-              disabled={room.members.find(m => m.id === userId)?.cameraForceDisabledByHost}
-              className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all active:scale-95 flex items-center gap-1.5 cursor-pointer ${
-                room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
-                  ? "bg-slate-850 text-slate-600 border border-slate-800/80 cursor-not-allowed"
-                  : localStream
-                  ? "bg-rose-500/10 text-rose-400 border border-rose-500/30 hover:bg-rose-500/20"
-                  : "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20"
-              }`}
-              title={
-                room.members.find(m => m.id === userId)?.cameraForceDisabledByHost
-                  ? "Disabled by Host"
-                  : localStream
-                  ? "Stop Camera"
-                  : "Start Camera"
-              }
-            >
-              {localStream ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
-              <span>{localStream ? "Stop Camera" : "Start Camera"}</span>
-            </button>
-          </div>
-        </div>
+        )}
 
         {/* Floating Warning for disabled camera */}
         {cameraDisabledNotification && (
@@ -1521,14 +1946,9 @@ export default function MyKaraoke() {
                 <div className="absolute inset-0 z-0">
                   {hasCam ? (
                     isMe ? (
-                      /* Real live webcam for current user */
+                      /* Real live webcam for current user - uses setLocalVideoRef to prevent blinking */
                       <video
-                        ref={(el) => {
-                          localVideoRef.current = el;
-                          if (el && localStream) {
-                            el.srcObject = localStream;
-                          }
-                        }}
+                        ref={setLocalVideoRef}
                         autoPlay
                         playsInline
                         muted
@@ -1592,12 +2012,19 @@ export default function MyKaraoke() {
                 {/* Info and action ribbon overlay */}
                 <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-slate-950 via-slate-950/90 to-transparent p-2 pt-5 z-10 flex items-center justify-between">
                   <div className="min-w-0 flex flex-col">
-                    <span className="text-[11px] font-bold text-slate-200 truncate flex items-center gap-1">
+                    <span className="text-[11px] font-bold text-slate-200 truncate flex items-center gap-1.5">
                       {isMe ? "You" : `@${member.name}`}
                       {isHostUser && (
                         <span className="text-[8px] font-bold font-mono uppercase bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1 py-0.2 rounded scale-90">
                           Host
                         </span>
+                      )}
+                      {hasCam && (
+                        (isMe ? isCameraMuted : member.isMuted) ? (
+                          <MicOff className="w-3.5 h-3.5 text-rose-450 shrink-0" />
+                        ) : (
+                          <Mic className="w-3.5 h-3.5 text-emerald-450 shrink-0" />
+                        )
                       )}
                     </span>
                   </div>
@@ -1621,6 +2048,148 @@ export default function MyKaraoke() {
               </div>
             );
           })}
+        </div>
+      </div>
+    );
+  };
+
+  const renderLoungeSocialHub = () => {
+    if (!room) return null;
+
+    return (
+      <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg flex flex-col h-[500px] max-h-[500px]">
+        {/* Hub Tab Bar Header */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3 mb-4 select-none">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center text-cyan-400">
+              <Users className="w-4.5 h-4.5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white leading-none">Lounge Social Hub</h3>
+              <p className="text-[10px] text-slate-400 mt-1">Chat and video hangout with your party</p>
+            </div>
+          </div>
+
+          {/* Tab buttons */}
+          <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800/80">
+            <button
+              onClick={() => setSocialHubTab("chat")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                socialHubTab === "chat"
+                  ? "bg-cyan-500 text-black shadow-lg shadow-cyan-500/10"
+                  : "text-slate-400 hover:text-white hover:bg-slate-900"
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Live Chat</span>
+            </button>
+            <button
+              onClick={() => setSocialHubTab("video")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer relative ${
+                socialHubTab === "video"
+                  ? "bg-cyan-500 text-black shadow-lg shadow-cyan-500/10"
+                  : "text-slate-400 hover:text-white hover:bg-slate-900"
+              }`}
+            >
+              <Video className="w-3.5 h-3.5" />
+              <span>Video Hangout</span>
+              {room.members.some(m => m.cameraOn) && (
+                <span className="absolute top-1 right-1 flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Tab Contents */}
+        {socialHubTab === "chat" ? (
+          <div className="flex-1 flex flex-col min-h-0 animate-fade-in">
+            <LoungeChatBox
+              chatMessages={chatMessages}
+              chatInput={chatInput}
+              setChatInput={setChatInput}
+              sendChatMessage={sendChatMessage}
+              sendChatReaction={sendChatReaction}
+              nickname={nickname}
+              isEmbedded={true}
+            />
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col min-h-0 animate-fade-in">
+            {renderLoungeVideoCall(true)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderVoteToSkipWidget = () => {
+    if (!room || !room.activeSong) return null;
+
+    const memberCount = room.members.length;
+    const votesNeeded = Math.max(1, Math.floor(memberCount / 2) + 1);
+    const currentVotes = room.skipVotes?.length || 0;
+    const hasVoted = room.skipVotes?.includes(userId) || false;
+
+    return (
+      <div id="singroom_vote_skip_widget" className="bg-slate-900/50 border border-slate-850 rounded-2xl p-4 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-sm select-none">🗳️</span>
+            <div>
+              <h4 className="text-xs font-bold font-mono uppercase tracking-wider text-cyan-400">
+                Vote to Skip
+              </h4>
+              <p className="text-[10px] text-slate-400 font-sans">
+                Democratic track skip system for guests
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-mono font-bold bg-slate-950 border border-slate-850 px-2 py-0.5 rounded-lg text-slate-300">
+            {currentVotes} / {votesNeeded} votes
+          </span>
+        </div>
+
+        {/* Progress bar */}
+        <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-850">
+          <div
+            className="bg-gradient-to-r from-cyan-400 to-indigo-500 h-full transition-all duration-300 rounded-full"
+            style={{ width: `${Math.min(100, (currentVotes / votesNeeded) * 100)}%` }}
+          />
+        </div>
+
+        {/* Action Button & Vote List */}
+        <div className="flex items-center justify-between gap-4 mt-1">
+          <button
+            onClick={voteToSkip}
+            className={`px-4 py-1.5 rounded-xl text-xs font-bold transition-all duration-200 flex items-center gap-1.5 cursor-pointer select-none active:scale-95 ${
+              hasVoted
+                ? "bg-indigo-500 hover:bg-indigo-400 text-white shadow-lg shadow-indigo-500/20"
+                : "bg-slate-800 hover:bg-slate-750 text-white border border-slate-700/60 hover:border-slate-600"
+            }`}
+          >
+            <span>{hasVoted ? "🗳️ Revoke Skip Vote" : "🗳️ Vote to Skip"}</span>
+          </button>
+          
+          {currentVotes > 0 && (
+            <div className="flex items-center -space-x-1.5 overflow-hidden">
+              {room.skipVotes?.map((voterId) => {
+                const voter = room.members.find((m) => m.id === voterId);
+                if (!voter) return null;
+                return (
+                  <span
+                    key={voterId}
+                    className="w-5 h-5 rounded-full bg-slate-800 border border-slate-900 text-[10px] font-bold text-cyan-400 flex items-center justify-center font-mono select-none"
+                    title={voter.name}
+                  >
+                    {voter.name.charAt(0).toUpperCase()}
+                  </span>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1664,6 +2233,16 @@ export default function MyKaraoke() {
                   <span className="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[9px] font-bold">GUEST</span>
                 )}
               </div>
+
+              {/* Sidebar toggle button */}
+              <button
+                onClick={() => setIsSidebarHidden(!isSidebarHidden)}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-cyan-400 hover:text-cyan-300 border border-slate-800 rounded-xl text-xs font-bold transition-all active:scale-95 cursor-pointer select-none"
+                title={isSidebarHidden ? "Show Sidebar Menu" : "Hide Sidebar Menu"}
+              >
+                {isSidebarHidden ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5 text-slate-400" />}
+                <span className="hidden sm:inline">{isSidebarHidden ? "Show Sidebar" : "Hide Sidebar"}</span>
+              </button>
 
               <button
                 onClick={leaveRoom}
@@ -1909,7 +2488,7 @@ export default function MyKaraoke() {
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                 
                 {/* Left Panel: YouTube Screen and Playback controls */}
-                <div className="lg:col-span-8 space-y-6">
+                <div className={`${isSidebarHidden ? "lg:col-span-12" : "lg:col-span-8"} space-y-6 transition-all duration-300`}>
                   
                   {/* YouTube Monitor Box */}
                   <div className="bg-slate-950 border border-slate-800 rounded-3xl overflow-hidden aspect-video shadow-2xl relative flex flex-col justify-between">
@@ -1995,8 +2574,14 @@ export default function MyKaraoke() {
                             <h4 className="text-sm font-extrabold text-white line-clamp-1 leading-snug mt-0.5">
                               {room.activeSong.title}
                             </h4>
-                            <p className="text-[10px] text-slate-400 font-mono mt-0.5">
-                              Queue added by <span className="text-slate-200 font-semibold">@{room.activeSong.queuedBy}</span>
+                            <p className="text-[10px] text-slate-400 font-mono mt-0.5 flex items-center gap-2">
+                              <span>Queue added by <span className="text-slate-200 font-semibold">@{room.activeSong.queuedBy}</span></span>
+                              {(room.skipVotes?.length ?? 0) > 0 && (
+                                <>
+                                  <span className="text-slate-600">•</span>
+                                  <span className="text-cyan-400 font-bold bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/20">🗳️ {room.skipVotes?.length} / {Math.max(1, Math.floor(room.members.length / 2) + 1)} skip votes</span>
+                                </>
+                              )}
                             </p>
                           </div>
                         </div>
@@ -2021,69 +2606,115 @@ export default function MyKaraoke() {
                       </div>
                     )}
                   </div>
-                  
-                  {/* LOUNGE VIDEO CALL GRIID FOR ALL ACTIVE PARTICIPANTS */}
-                  {renderLoungeVideoCall()}
 
-                  {/* VOICE ENHANCER CARD FOR HOST */}
-                  <VoiceEnhancerCard />
-
-                  {/* HOST CONTROLS & INFO BOARD */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* HOST SEARCH YOUTUBE CARD */}
+                  <div className="bg-slate-900/60 backdrop-blur-xl border border-slate-800/80 rounded-3xl p-5 shadow-xl space-y-4 hover:border-cyan-500/25 transition-all duration-300 relative overflow-hidden group/hostcard">
+                    {/* Subtle top-right corner ambient glow */}
+                    <div className="absolute -top-12 -right-12 w-28 h-28 bg-cyan-500/5 rounded-full blur-2xl pointer-events-none group-hover/hostcard:bg-cyan-500/8 transition-colors duration-300" />
                     
-                    {/* Share Invitation Card */}
-                    <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg flex items-center justify-between">
-                      <div className="space-y-2">
-                        <span className="text-[9px] font-mono uppercase tracking-wider text-slate-500">Party Invite Link</span>
-                        <h4 className="text-sm font-bold text-white">Copy or share room URL</h4>
-                        <p className="text-xs text-slate-400 leading-relaxed max-w-xs">
-                          Give others the link or let them join from any screen using code: <strong className="text-cyan-400 font-mono">{room.id}</strong>
-                        </p>
-                        <button
-                          onClick={copyRoomLink}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-950 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 rounded-lg text-[11px] font-semibold transition-all active:scale-95 cursor-pointer"
-                        >
-                          {copiedCode ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : <Share2 className="w-3.5 h-3.5 text-slate-400" />}
-                          <span>{copiedCode ? "Copied!" : "Copy Joining Link"}</span>
-                        </button>
-                      </div>
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-2.5 relative z-10">
+                      <h3 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
+                        <Search className="w-4 h-4 text-cyan-400" />
+                        <span>Search & Queue YouTube Songs</span>
+                      </h3>
+                      <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-500">
+                        DIRECT HOST SEARCH
+                      </span>
+                    </div>
 
-                      <div className="bg-slate-950 p-2 border border-slate-800 rounded-xl shrink-0">
-                        <QRCodeSVG
-                          value={`${window.location.origin}/?room=${room.id}`}
-                          size={110}
-                          bgColor={"#090d16"}
-                          fgColor={"#22d3ee"} // vibrant cyan
-                          level={"H"}
-                          includeMargin={true}
+                    <form onSubmit={searchSongs} className="flex gap-2 relative">
+                      <div className="relative flex-1">
+                        <input
+                          type="text"
+                          placeholder="Search YouTube track (e.g. Queen)"
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                          onFocus={() => setShowSuggestions(true)}
+                          onBlur={() => {
+                            setTimeout(() => setShowSuggestions(false), 200);
+                          }}
+                          className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-semibold focus:outline-none focus:border-cyan-500 text-white placeholder-slate-600"
                         />
-                      </div>
-                    </div>
 
-                    {/* Simple search helper for TV (also can add directly!) */}
-                    <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col justify-between">
-                      <div className="space-y-1.5">
-                        <h4 className="text-sm font-bold text-white flex items-center gap-1.5">
-                          <Tv className="w-4 h-4 text-cyan-400" />
-                          <span>Lounge Screen Controller</span>
-                        </h4>
-                        <p className="text-xs text-slate-400 leading-relaxed">
-                          Scan the QR code with your smartphone for a beautiful, hand-held mobile remote. Guests can use it to add tracks instantly!
-                        </p>
+                        {/* Auto-suggest suggestions list */}
+                        {showSuggestions && suggestions.length > 0 && (
+                          <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[220px] overflow-y-auto divide-y divide-slate-900/60">
+                            {suggestions.map((suggestion, idx) => (
+                              <button
+                                key={`host-main-suggest-${idx}`}
+                                type="button"
+                                onMouseDown={(e) => {
+                                  e.preventDefault();
+                                  handleSelectSuggestion(suggestion);
+                                }}
+                                className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
+                              >
+                                <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                <span className="truncate">{suggestion}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
+                      <button
+                        type="submit"
+                        className="px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-bold rounded-xl text-xs transition-all active:scale-95 flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        <Search className="w-3.5 h-3.5" />
+                        <span>Search</span>
+                      </button>
+                    </form>
 
-                      <div className="flex items-center gap-1.5 text-xs text-slate-500 font-mono mt-2">
-                        <Users className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Active participants: {room.members.length}</span>
+                    {isSearching && (
+                      <div className="py-8 text-center text-xs text-slate-500 font-mono flex flex-col items-center gap-2">
+                        <span className="w-5 h-5 rounded-full border-2 border-cyan-400/20 border-t-cyan-400 animate-spin" />
+                        <span>Searching YouTube...</span>
                       </div>
-                    </div>
+                    )}
 
+                    {!isSearching && searchResults.length > 0 && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[260px] overflow-y-auto pr-1">
+                        {searchResults.map((song) => (
+                          <div
+                            key={`host-main-song-${song.videoId}`}
+                            className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2 rounded-2xl hover:border-slate-700 hover:bg-slate-900 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              <img
+                                src={song.thumbnail}
+                                alt={song.title}
+                                className="w-10 h-10 rounded-xl object-cover border border-slate-850 shrink-0"
+                              />
+                              <div className="min-w-0">
+                                <h4 className="text-[11px] font-bold text-white line-clamp-1 leading-snug group-hover:text-cyan-400 transition-colors">
+                                  {song.title}
+                                </h4>
+                                <p className="text-[9px] text-slate-500 line-clamp-1 mt-0.5">
+                                  {song.channelTitle}
+                                </p>
+                              </div>
+                            </div>
+
+                            <button
+                              onClick={() => addSongToQueue(song)}
+                              className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-all shrink-0 cursor-pointer"
+                            >
+                              Add
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
+                  
+                  {/* LOUNGE SOCIAL HUB (COMBINED CHAT & VIDEO CALL) */}
+                  {renderLoungeSocialHub()}
 
                 </div>
 
                 {/* Right Panel: Host Central Queue Sidebar */}
-                <div className="lg:col-span-4 bg-slate-900/60 border border-slate-800 rounded-3xl p-5 shadow-xl space-y-4">
+                {!isSidebarHidden && (
+                  <div className="lg:col-span-4 bg-slate-900/60 border border-slate-800 rounded-3xl p-5 shadow-xl space-y-4 animate-fade-in">
                   <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                     <div className="flex items-center gap-2">
                       <Users className="w-4 h-4 text-indigo-400" />
@@ -2096,15 +2727,24 @@ export default function MyKaraoke() {
                   {/* Queue playlist list */}
                   <div className="space-y-2.5 max-h-[500px] overflow-y-auto pr-1">
                     {room.queue.length === 0 ? (
-                      <div className="py-12 text-center text-xs text-slate-500 font-mono space-y-2">
+                      <div className="py-12 text-center text-xs text-slate-500 font-mono space-y-2 flex flex-col items-center justify-center">
                         <p>The queue is currently empty.</p>
                         <p className="text-[10px] text-slate-600">Guests can add tracks using the search panel!</p>
+                        {isCurrentUserHost && savedBackupCount > 0 && (
+                          <button
+                            onClick={handleRestoreBackup}
+                            className="mt-3 inline-flex items-center gap-2 px-3.5 py-1.5 bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-black font-black text-[10px] rounded-lg shadow-lg shadow-cyan-500/10 active:scale-95 transition-all cursor-pointer"
+                          >
+                            <History className="w-3.5 h-3.5 text-black" />
+                            <span>Restore Previous Queue ({savedBackupCount} Tracks)</span>
+                          </button>
+                        )}
                       </div>
                     ) : (
                       room.queue.map((item, index) => (
                         <div
                           key={item.id}
-                          className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-800/80 p-2.5 rounded-xl hover:border-slate-700 transition-all group"
+                          className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-800/80 p-2.5 rounded-xl hover:border-slate-700 hover:bg-slate-900 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
                         >
                           <div className="flex items-center gap-2.5 min-w-0">
                             <img
@@ -2201,91 +2841,95 @@ export default function MyKaraoke() {
                     </div>
                   </div>
 
-                  {/* QUICK SEARCH FOR HOST */}
-                  <div className="border-t border-slate-800 pt-4 mt-2 space-y-2.5">
-                    <h4 className="text-[11px] font-bold font-mono uppercase text-slate-400">Host Direct Search:</h4>
-                    <form onSubmit={searchSongs} className="relative">
-                      <input
-                        type="text"
-                        placeholder="Search songs directly..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        onFocus={() => setShowSuggestions(true)}
-                        onBlur={() => {
-                          setTimeout(() => setShowSuggestions(false), 200);
-                        }}
-                        className="w-full pl-3 pr-8 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs placeholder-slate-600 text-white focus:outline-none focus:border-cyan-500"
-                      />
-                      <button
-                        type="submit"
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
-                      >
-                        <Search className="w-4 h-4" />
-                      </button>
 
-                      {/* Auto-suggest suggestions list */}
-                      {showSuggestions && suggestions.length > 0 && (
-                        <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl z-50 max-h-[200px] overflow-y-auto divide-y divide-slate-900/60 animate-fade-in">
-                          {suggestions.map((suggestion, idx) => (
-                            <button
-                              key={`host-suggest-${idx}`}
-                              type="button"
-                              onClick={() => handleSelectSuggestion(suggestion)}
-                              className="w-full px-3 py-2 text-left text-[11px] text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
-                            >
-                              <Search className="w-3 h-3 text-slate-600 shrink-0" />
-                              <span className="truncate">{suggestion}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </form>
 
-                    {searchResults.length > 0 && (
-                      <div className="bg-slate-950 border border-slate-800 rounded-xl max-h-[220px] overflow-y-auto p-1.5 space-y-1 animate-fade-in shadow-inner">
-                        {searchResults.map((song) => (
-                          <div
-                            key={song.videoId}
-                            className="flex items-center justify-between gap-2 p-1.5 hover:bg-slate-900 rounded-lg transition-colors cursor-pointer"
-                            onClick={() => addSongToQueue(song)}
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <img
-                                src={song.thumbnail}
-                                alt={song.title}
-                                className="w-8 h-8 rounded object-cover border border-slate-800 shrink-0"
-                              />
-                              <div className="min-w-0">
-                                <h5 className="text-[10px] font-semibold text-white line-clamp-1 leading-normal">
-                                  {song.title}
-                                </h5>
-                                <p className="text-[9px] text-slate-500 line-clamp-1">
-                                  {song.channelTitle}
-                                </p>
-                              </div>
-                            </div>
-                            <span className="bg-indigo-600 hover:bg-indigo-500 text-white p-1 rounded shrink-0">
-                              <Plus className="w-3 h-3" />
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                  {/* VOICE ENHANCER CARD FOR HOST */}
+                  <div className="border-t border-slate-800/80 pt-4 mt-2">
+                    <VoiceEnhancerCard />
                   </div>
 
-                  {/* LIVE LOUNGE CHAT */}
-                  <div className="border-t border-slate-800/80 pt-4 mt-2">
-                    <LoungeChatBox
-                      chatMessages={chatMessages}
-                      chatInput={chatInput}
-                      setChatInput={setChatInput}
-                      sendChatMessage={sendChatMessage}
-                      sendChatReaction={sendChatReaction}
-                      nickname={nickname}
-                    />
+                  {/* HOST CONTROLS & INFO BOARD */}
+                  <div className="border-t border-slate-800/80 pt-4 mt-2 space-y-4">
+                    
+                    {/* Share Invitation Card */}
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col gap-3">
+                      <div 
+                        onClick={() => setIsShareCardCollapsed(!isShareCardCollapsed)}
+                        className="flex items-center justify-between cursor-pointer select-none group"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] font-mono uppercase tracking-wider text-slate-500">Party Invite Link</span>
+                          <span className="text-xs font-bold text-white">- {isShareCardCollapsed ? "Show" : "Hide"} QR & Details</span>
+                        </div>
+                        <div className="text-slate-500 hover:text-slate-300 text-xs flex items-center gap-1 font-mono">
+                          {isShareCardCollapsed ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5" />}
+                          <span>{isShareCardCollapsed ? "Show" : "Hide"}</span>
+                        </div>
+                      </div>
+
+                      {!isShareCardCollapsed && (
+                        <div className="flex flex-col gap-3 animate-fade-in">
+                          <div className="space-y-2">
+                            <h4 className="text-sm font-bold text-white">Copy or share room URL</h4>
+                            <p className="text-xs text-slate-400 leading-relaxed">
+                              Give others the link or let them join from any screen using code: <strong className="text-cyan-400 font-mono">{room.id}</strong>
+                            </p>
+                            <button
+                              onClick={copyRoomLink}
+                              className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 bg-slate-950 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 rounded-lg text-[11px] font-semibold transition-all active:scale-95 cursor-pointer"
+                            >
+                              {copiedCode ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : <Share2 className="w-3.5 h-3.5 text-slate-400" />}
+                              <span>{copiedCode ? "Copied!" : "Copy Joining Link"}</span>
+                            </button>
+                          </div>
+
+                          <div className="bg-slate-950 p-2 border border-slate-800 rounded-xl flex justify-center">
+                            <QRCodeSVG
+                              value={`${window.location.origin}/?room=${room.id}`}
+                              size={110}
+                              bgColor={"#090d16"}
+                              fgColor={"#22d3ee"} // vibrant cyan
+                              level={"H"}
+                              includeMargin={true}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Simple search helper for TV (also can add directly!) */}
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col justify-between">
+                      <div 
+                        onClick={() => setIsControllerCardCollapsed(!isControllerCardCollapsed)}
+                        className="flex items-center justify-between cursor-pointer select-none group"
+                      >
+                        <h4 className="text-sm font-bold text-white flex items-center gap-1.5">
+                          <Tv className="w-4 h-4 text-cyan-400" />
+                          <span>Lounge Screen Controller</span>
+                        </h4>
+                        <div className="text-slate-500 hover:text-slate-300 text-xs flex items-center gap-1 font-mono">
+                          {isControllerCardCollapsed ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5" />}
+                          <span>{isControllerCardCollapsed ? "Show" : "Hide"}</span>
+                        </div>
+                      </div>
+
+                      {!isControllerCardCollapsed && (
+                        <div className="space-y-1.5 mt-3 animate-fade-in">
+                          <p className="text-xs text-slate-400 leading-relaxed">
+                            Scan the QR code with your smartphone for a beautiful, hand-held mobile remote. Guests can use it to add tracks instantly!
+                          </p>
+                          <div className="flex items-center gap-1.5 text-xs text-slate-500 font-mono mt-2 pt-1">
+                            <Users className="w-3.5 h-3.5 text-slate-400" />
+                            <span>Active participants: {room.members.length}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
                   </div>
 
                 </div>
+                )}
 
               </div>
             ) : (
@@ -2411,14 +3055,6 @@ export default function MyKaraoke() {
                               {room.isPlaying ? <Pause className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
                               <span>{room.isPlaying ? "Pause" : "Play"}</span>
                             </button>
-                            <button
-                              onClick={() => playbackControl("next")}
-                              className="px-3 py-1.5 bg-slate-850 hover:bg-slate-800 text-white text-xs font-bold rounded-lg border border-slate-750 transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
-                              title="Skip Song"
-                            >
-                              <SkipForward className="w-3.5 h-3.5" />
-                              <span>Skip</span>
-                            </button>
                           </div>
                         ) : (
                           <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
@@ -2439,6 +3075,9 @@ export default function MyKaraoke() {
                           {isGuestStreamMuted ? "🔇 Audio muted (no echo)" : "🔊 Audio active"}
                         </span>
                       </div>
+
+                      {/* Vote to Skip system */}
+                      {renderVoteToSkipWidget()}
                     </div>
                   </div>
                 ) : (
@@ -2532,7 +3171,10 @@ export default function MyKaraoke() {
                                 <button
                                   key={`guest-suggest-mob-${idx}`}
                                   type="button"
-                                  onClick={() => handleSelectSuggestion(suggestion)}
+                                  onMouseDown={(e) => {
+                                    e.preventDefault();
+                                    handleSelectSuggestion(suggestion);
+                                  }}
                                   className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
                                 >
                                   <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
@@ -2563,7 +3205,7 @@ export default function MyKaraoke() {
                           {searchResults.map((song) => (
                             <div
                               key={song.videoId}
-                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl hover:border-slate-700 transition-all group"
+                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl hover:border-slate-600 hover:bg-slate-850 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
                             >
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
@@ -2611,15 +3253,26 @@ export default function MyKaraoke() {
 
                       <div className="space-y-2.5 max-h-[440px] overflow-y-auto pr-1">
                         {room.queue.length === 0 ? (
-                          <div className="py-12 text-center text-xs text-slate-600 border border-slate-900 rounded-2xl">
-                            <p>The queue is currently empty.</p>
-                            <p className="text-[10px] text-slate-700 mt-1">Be the first to search and add a song!</p>
+                          <div className="py-12 text-center text-xs text-slate-600 border border-slate-900 rounded-2xl flex flex-col items-center justify-center gap-2.5">
+                            <div>
+                              <p>The queue is currently empty.</p>
+                              <p className="text-[10px] text-slate-700 mt-1">Be the first to search and add a song!</p>
+                            </div>
+                            {isCurrentUserHost && savedBackupCount > 0 && (
+                              <button
+                                onClick={handleRestoreBackup}
+                                className="inline-flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-black font-black text-xs rounded-xl shadow-lg shadow-cyan-500/20 active:scale-95 transition-all cursor-pointer"
+                              >
+                                <History className="w-4 h-4 text-black" />
+                                <span>Restore Previous Queue ({savedBackupCount} Tracks)</span>
+                              </button>
+                            )}
                           </div>
                         ) : (
                           room.queue.map((item, index) => (
                             <div
                               key={item.id}
-                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl"
+                              className="flex items-center justify-between gap-3 bg-slate-900 border border-slate-800/80 p-2.5 rounded-2xl hover:border-slate-700 hover:bg-slate-850 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
                             >
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
@@ -2628,7 +3281,7 @@ export default function MyKaraoke() {
                                   className="w-10 h-10 rounded-lg object-cover border border-slate-800 shrink-0"
                                 />
                                 <div className="min-w-0">
-                                  <h4 className="text-xs font-bold text-white line-clamp-1">
+                                  <h4 className="text-xs font-bold text-white line-clamp-1 group-hover:text-cyan-400 transition-colors">
                                     {item.title}
                                   </h4>
                                   <p className="text-[10px] text-slate-500 font-mono mt-0.5">
@@ -2723,7 +3376,7 @@ export default function MyKaraoke() {
                 <div className="hidden md:grid md:grid-cols-12 md:gap-6 items-start">
                   
                   {/* Left Column - Search and Upcoming Queue */}
-                  <div className="md:col-span-7 space-y-6">
+                  <div className={`${isSidebarHidden ? "md:col-span-12" : "md:col-span-7"} space-y-6 transition-all duration-300`}>
                     
                     {/* Search Panel Card */}
                     <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
@@ -2758,7 +3411,10 @@ export default function MyKaraoke() {
                                 <button
                                   key={`guest-suggest-desk-${idx}`}
                                   type="button"
-                                  onClick={() => handleSelectSuggestion(suggestion)}
+                                  onMouseDown={(e) => {
+                                    e.preventDefault();
+                                    handleSelectSuggestion(suggestion);
+                                  }}
                                   className="w-full px-4 py-2.5 text-left text-xs text-slate-300 hover:text-cyan-400 hover:bg-slate-900 transition-colors flex items-center gap-2 cursor-pointer"
                                 >
                                   <Search className="w-3.5 h-3.5 text-slate-600 shrink-0" />
@@ -2789,7 +3445,7 @@ export default function MyKaraoke() {
                           {searchResults.map((song) => (
                             <div
                               key={`desk-song-${song.videoId}`}
-                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl hover:border-slate-800 transition-all group"
+                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl hover:border-slate-700 hover:bg-slate-900 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
                             >
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
@@ -2840,15 +3496,26 @@ export default function MyKaraoke() {
 
                       <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
                         {room.queue.length === 0 ? (
-                          <div className="py-12 text-center text-xs text-slate-500 font-mono border border-slate-900/40 rounded-2xl">
-                            <p>No songs queued up currently.</p>
-                            <p className="text-[10px] text-slate-600 mt-1">Be the first to search and add a track above!</p>
+                          <div className="py-12 text-center text-xs text-slate-500 font-mono border border-slate-900/40 rounded-2xl flex flex-col items-center justify-center gap-2.5">
+                            <div>
+                              <p>No songs queued up currently.</p>
+                              <p className="text-[10px] text-slate-600 mt-1">Be the first to search and add a track above!</p>
+                            </div>
+                            {isCurrentUserHost && savedBackupCount > 0 && (
+                              <button
+                                onClick={handleRestoreBackup}
+                                className="inline-flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-black font-black text-xs rounded-xl shadow-lg shadow-cyan-500/20 active:scale-95 transition-all cursor-pointer"
+                              >
+                                <History className="w-4 h-4 text-black" />
+                                <span>Restore Saved Queue ({savedBackupCount} Songs)</span>
+                              </button>
+                            )}
                           </div>
                         ) : (
                           room.queue.map((item, index) => (
                             <div
                               key={`desk-queue-${item.id}`}
-                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl"
+                              className="flex items-center justify-between gap-3 bg-slate-950 border border-slate-850 p-2.5 rounded-2xl hover:border-slate-700 hover:bg-slate-900 hover:scale-[1.015] active:scale-[0.985] hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200 group"
                             >
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
@@ -2857,7 +3524,7 @@ export default function MyKaraoke() {
                                   className="w-10 h-10 rounded-lg object-cover border border-slate-850 shrink-0"
                                 />
                                 <div className="min-w-0">
-                                  <h4 className="text-xs font-bold text-white line-clamp-1">
+                                  <h4 className="text-xs font-bold text-white line-clamp-1 group-hover:text-cyan-400 transition-colors">
                                     {item.title}
                                   </h4>
                                   <p className="text-[10px] text-slate-500 font-mono mt-0.5">
@@ -2884,7 +3551,8 @@ export default function MyKaraoke() {
                   </div>
 
                   {/* Right Column - Soundboard, Chat & Recently Played */}
-                  <div className="md:col-span-5 space-y-6">
+                  {!isSidebarHidden && (
+                    <div className="md:col-span-5 space-y-6 animate-fade-in">
                     
                     {/* Live Lounge Chat Card */}
                     <LoungeChatBox
@@ -2944,6 +3612,7 @@ export default function MyKaraoke() {
                     </div>
 
                   </div>
+                  )}
 
                 </div>
 
@@ -3166,7 +3835,8 @@ export function LoungeChatBox({
   setChatInput,
   sendChatMessage,
   sendChatReaction,
-  nickname
+  nickname,
+  isEmbedded = false
 }: {
   chatMessages: any[];
   chatInput: string;
@@ -3174,6 +3844,7 @@ export function LoungeChatBox({
   sendChatMessage: (textStr?: string) => void;
   sendChatReaction: (emoji: string) => void;
   nickname: string;
+  isEmbedded?: boolean;
 }) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -3189,21 +3860,23 @@ export function LoungeChatBox({
   const REACTION_EMOJIS = ["🎉", "👏", "🔥", "🎙️", "❤️", "🌟"];
 
   return (
-    <div className="bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg flex flex-col h-[400px]">
-      <div className="flex items-center justify-between border-b border-slate-800 pb-2.5 mb-3 select-none">
-        <div>
-          <h4 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
-            <MessageSquare className="w-4 h-4 text-cyan-400" />
-            <span>Lounge Live Chat</span>
-          </h4>
-          <p className="text-[10px] text-slate-400 mt-1 font-sans">
-            Real-time messages and short emoji reactions!
-          </p>
+    <div className={isEmbedded ? "flex flex-col flex-1 h-full max-h-full overflow-hidden min-h-0" : "bg-slate-900/40 border border-slate-800 rounded-3xl p-5 shadow-lg flex flex-col h-[400px] max-h-[400px] overflow-hidden"}>
+      {!isEmbedded && (
+        <div className="flex items-center justify-between border-b border-slate-800 pb-2.5 mb-3 select-none">
+          <div>
+            <h4 className="text-xs font-bold font-mono uppercase tracking-widest text-cyan-400 flex items-center gap-1.5">
+              <MessageSquare className="w-4 h-4 text-cyan-400" />
+              <span>Lounge Live Chat</span>
+            </h4>
+            <p className="text-[10px] text-slate-400 mt-1 font-sans">
+              Real-time messages and short emoji reactions!
+            </p>
+          </div>
+          <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-slate-500 shrink-0">
+            LIVE STREAM
+          </span>
         </div>
-        <span className="text-[9px] font-mono font-bold bg-slate-950 border border-slate-800 px-2 py-1 rounded text-slate-500 shrink-0">
-          LIVE STREAM
-        </span>
-      </div>
+      )}
 
       {/* Message List Area */}
       <div className="flex-1 overflow-y-auto space-y-2 pr-1 mb-3 scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent">

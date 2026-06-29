@@ -111,6 +111,7 @@ interface SingRoomParty {
   }[];
   history: YTPlaylistItem[];
   lastActiveAt?: number;
+  skipVotes?: string[];
 }
 
 const partyRooms: Record<string, SingRoomParty> = {};
@@ -259,7 +260,8 @@ app.post("/api/party-rooms/create", (req, res) => {
     activeSong: null,
     queue: [],
     members: [],
-    history: []
+    history: [],
+    skipVotes: []
   };
 
   partyRooms[code] = newRoom;
@@ -990,7 +992,8 @@ wss.on("connection", (ws: WebSocket) => {
               activeSong: null,
               queue: [],
               members: [],
-              history: []
+              history: [],
+              skipVotes: []
             };
           }
 
@@ -1081,7 +1084,14 @@ wss.on("connection", (ws: WebSocket) => {
             return;
           }
 
+          // Guest cannot remove/skip the active song
+          if (room.activeSong && room.activeSong.id === itemId && !isHost) {
+            console.log(`[WS party-remove-song Permission Denied] Guest ${senderName} tried to remove/skip the active song. Only the host can skip/remove the active song.`);
+            return;
+          }
+
           if (room.activeSong && room.activeSong.id === itemId) {
+            room.skipVotes = [];
             if (room.queue.length > 0) {
               room.activeSong = room.queue.shift() || null;
               room.isPlaying = true;
@@ -1144,7 +1154,15 @@ wss.on("connection", (ws: WebSocket) => {
           const sender = room.members.find(m => m.id === memberId);
           const senderName = sender ? sender.name : "";
 
-          // Invited guest cannot stop/pause/skip the current playing song added by other participants
+          // ONLY the host can skip or go back to previous songs
+          if (action === "next" || action === "prev") {
+            if (!isHost) {
+              console.log(`[WS party-playback-control Permission Denied] Guest ${senderName} tried to skip/prev but only the host has permission to skip/previous songs.`);
+              return;
+            }
+          }
+
+          // Invited guest cannot stop/pause the current playing song added by other participants
           if (!isHost) {
             if (!room.activeSong || room.activeSong.queuedBy !== senderName) {
               console.log(`[WS party-playback-control Permission Denied] Guest ${senderName} tried to control playback but they did not queue the active song "${room.activeSong?.title || 'None'}"`);
@@ -1159,6 +1177,7 @@ wss.on("connection", (ws: WebSocket) => {
           } else if (action === "pause") {
             room.isPlaying = false;
           } else if (action === "next") {
+            room.skipVotes = [];
             if (room.activeSong) {
               room.history.push(room.activeSong);
               if (room.history.length > 20) room.history.shift();
@@ -1171,6 +1190,7 @@ wss.on("connection", (ws: WebSocket) => {
               room.isPlaying = false;
             }
           } else if (action === "prev") {
+            room.skipVotes = [];
             if (room.history.length > 0) {
               const prevSong = room.history.pop()!;
               if (room.activeSong) {
@@ -1265,6 +1285,19 @@ wss.on("connection", (ws: WebSocket) => {
           break;
         }
 
+        case "party-audio-frame": {
+          const { audio, userId: senderUserId } = data;
+          if (!roomId || !senderUserId) return;
+          
+          // Broadcast audio frame to all other users in the room, skipping the sender to prevent self-echo
+          broadcastToRoom(roomId, {
+            type: "party-audio-frame",
+            userId: senderUserId,
+            audio
+          }, ws);
+          break;
+        }
+
         case "party-time-sync": {
           const { time } = data;
           if (!roomId) return;
@@ -1272,6 +1305,82 @@ wss.on("connection", (ws: WebSocket) => {
             type: "party-time-sync",
             time
           }, ws); // skip the sender
+          break;
+        }
+
+        case "party-vote-skip": {
+          const { userId } = data;
+          if (!roomId || !userId) return;
+
+          const room = partyRooms[roomId];
+          if (!room) return;
+
+          if (!room.activeSong) {
+            console.log(`[WS party-vote-skip] No active song to vote on in room ${roomId}`);
+            return;
+          }
+
+          if (!room.skipVotes) {
+            room.skipVotes = [];
+          }
+
+          const member = room.members.find(m => m.id === userId);
+          if (!member) {
+            console.log(`[WS party-vote-skip] User ${userId} is not a member of room ${roomId}`);
+            return;
+          }
+
+          if (!room.skipVotes.includes(userId)) {
+            room.skipVotes.push(userId);
+            console.log(`[WS party-vote-skip] User ${member.name} voted to skip in room ${roomId}. Total votes: ${room.skipVotes.length}`);
+          } else {
+            room.skipVotes = room.skipVotes.filter(id => id !== userId);
+            console.log(`[WS party-vote-skip] User ${member.name} removed skip vote in room ${roomId}. Total votes: ${room.skipVotes.length}`);
+          }
+
+          const votesNeeded = Math.max(1, Math.floor(room.members.length / 2) + 1);
+          if (room.skipVotes.length >= votesNeeded) {
+            console.log(`[WS party-vote-skip] Vote threshold reached (${room.skipVotes.length}/${votesNeeded}) in room ${roomId}. Skipping song!`);
+            
+            const skippedSongTitle = room.activeSong.title;
+            if (room.activeSong) {
+              room.history.push(room.activeSong);
+              if (room.history.length > 20) room.history.shift();
+            }
+            if (room.queue.length > 0) {
+              room.activeSong = room.queue.shift() || null;
+              room.isPlaying = true;
+            } else {
+              room.activeSong = null;
+              room.isPlaying = false;
+            }
+            
+            room.skipVotes = [];
+
+            // Broadcast skip notification in chat
+            broadcastToRoom(roomId, {
+              type: "chat-message",
+              message: {
+                id: "sys_vote_skip_" + Date.now(),
+                roomId,
+                sender: "System",
+                text: `🗳️ Vote to skip passed! Skipping "${skippedSongTitle}".`,
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                type: "system"
+              }
+            });
+
+            broadcastToRoom(roomId, {
+              type: "party-playback-updated",
+              action: "next",
+              value: null
+            });
+          }
+
+          broadcastToRoom(roomId, {
+            type: "party-updated",
+            room
+          });
           break;
         }
       }
